@@ -139,6 +139,26 @@ async def test_imperial_tenth_degree_source_reading_survives(
     assert state.attributes["current_temperature"] == 71.3
 
 
+async def test_imperial_precision_tracks_finest_source_reading(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_id, wrapper_entity
+) -> None:
+    """A half-degree start does not pin precision once tenths appear."""
+    hass.config.units = US_CUSTOMARY_SYSTEM
+    await create_wrapper()
+
+    thermostat.external_set(current=71.5)
+    await hass.async_block_till_done()
+    assert wrapper_entity().precision == PRECISION_HALVES
+
+    # A tenth-degree reading later on refines precision immediately.
+    thermostat.external_set(current=71.4)
+    await hass.async_block_till_done()
+    assert wrapper_entity().precision == PRECISION_TENTHS
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.attributes["current_temperature"] == 71.4
+
+
 async def test_imperial_whole_source_readings_keep_whole_precision(
     hass: HomeAssistant, create_wrapper, wrapper_entity
 ) -> None:
