@@ -447,13 +447,29 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             with contextlib.suppress(ValueError):
                 self._last_flip = datetime.fromisoformat(raw_flip)
 
-        self._expected_mode = self._attr_hvac_mode
-        self._expected_temp = self._target_temp
+        # A single-setpoint mode owns one side of the remembered pair, so the
+        # restored active value restamps the side its mode owns.
+        if self._target_temp is not None:
+            if self._attr_hvac_mode == HVACMode.HEAT:
+                self._target_temp_low = self._target_temp
+            elif self._attr_hvac_mode == HVACMode.COOL:
+                self._target_temp_high = self._target_temp
 
         if self._target_temp_low is not None and self._target_temp_high is not None:
             self._target_temp_low, self._target_temp_high = self._normalize(
-                self._target_temp_low, self._target_temp_high
+                self._target_temp_low,
+                self._target_temp_high,
+                anchor_low=self._attr_hvac_mode != HVACMode.COOL,
             )
+        if self._attr_hvac_mode == HVACMode.HEAT and self._target_temp_low is not None:
+            self._target_temp = self._target_temp_low
+        elif (
+            self._attr_hvac_mode == HVACMode.COOL and self._target_temp_high is not None
+        ):
+            self._target_temp = self._target_temp_high
+
+        self._expected_mode = self._attr_hvac_mode
+        self._expected_temp = self._target_temp
 
     def _cancel_timers(self) -> None:
         """Cancel any pending timers."""
@@ -466,21 +482,38 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
     # ------------------------------------------------------------------
     # Geometry helpers
     # ------------------------------------------------------------------
-    def _normalize(self, low: float, high: float) -> tuple[float, float]:
-        """Clamp both bounds and restore the configured gap."""
+    def _normalize(
+        self, low: float, high: float, *, anchor_low: bool = True
+    ) -> tuple[float, float]:
+        """
+        Clamp both bounds and restore the configured gap.
+
+        ``anchor_low`` chooses which bound holds when the pair ends up closer
+        than the minimum gap: the gap is carved out of the side the user is
+        not setting, so editing one setpoint never drags the other along.
+        """
         min_temp = self.min_temp
         max_temp = self.max_temp
         low = max(min_temp, min(low, max_temp))
         high = max(min_temp, min(high, max_temp))
 
         if high - low + GAP_EPSILON < self._min_gap:
-            high = low + self._min_gap
-            if high > max_temp:
-                high = max_temp
-                low = max(min_temp, max_temp - self._min_gap)
-            if low < min_temp:
-                low = min_temp
-                high = min(max_temp, min_temp + self._min_gap)
+            if anchor_low:
+                high = low + self._min_gap
+                if high > max_temp:
+                    high = max_temp
+                    low = max(min_temp, max_temp - self._min_gap)
+                if low < min_temp:
+                    low = min_temp
+                    high = min(max_temp, min_temp + self._min_gap)
+            else:
+                low = high - self._min_gap
+                if low < min_temp:
+                    low = min_temp
+                    high = min(max_temp, min_temp + self._min_gap)
+                if high > max_temp:
+                    high = max_temp
+                    low = max(min_temp, max_temp - self._min_gap)
         return low, high
 
     def _step_tolerance(self) -> float:
@@ -754,37 +787,39 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         self._pending = False
 
         if source_temp is not None:
-            self._reconcile_bounds(source_temp)
+            self._apply_bound(source_temp)
         elif self._target_temp_low is None or self._target_temp_high is None:
             self._seed_bounds(None)
 
         if initial:
             self._clear_pending()
 
-    def _reconcile_bounds(self, source_temp: float) -> None:
-        """Keep low/high coherent with a single-setpoint source change."""
-        if self._attr_hvac_mode == HVACMode.HEAT:
-            low = source_temp
-            high = (
-                source_temp + self._min_gap
-                if self._target_temp_high is None
-                or abs(self._target_temp_high - (source_temp + self._min_gap))
-                > GAP_EPSILON
-                else self._target_temp_high
+    def _apply_bound(self, temperature: float) -> None:
+        """
+        Store a single setpoint on the side the current mode owns.
+
+        The wrapper quietly remembers both a heating and a cooling setpoint
+        at all times: heat edits the low one, cool edits the high one, and
+        the side the current mode does not own keeps whatever the user last
+        left there.
+        """
+        mode = self._attr_hvac_mode
+        if mode == HVACMode.COOL:
+            self._target_temp_high = temperature
+            if self._target_temp_low is None:
+                self._target_temp_low = temperature - self._min_gap
+            self._target_temp_low, self._target_temp_high = self._normalize(
+                self._target_temp_low, self._target_temp_high, anchor_low=False
             )
-            self._target_temp_low, self._target_temp_high = self._normalize(low, high)
-        elif self._attr_hvac_mode == HVACMode.COOL:
-            high = source_temp
-            low = (
-                source_temp - self._min_gap
-                if self._target_temp_low is None
-                or abs(self._target_temp_low - (source_temp - self._min_gap))
-                > GAP_EPSILON
-                else self._target_temp_low
+        elif mode is None or mode == HVACMode.HEAT:
+            self._target_temp_low = temperature
+            if self._target_temp_high is None:
+                self._target_temp_high = temperature + self._min_gap
+            self._target_temp_low, self._target_temp_high = self._normalize(
+                self._target_temp_low, self._target_temp_high
             )
-            self._target_temp_low, self._target_temp_high = self._normalize(low, high)
         elif self._target_temp_low is None or self._target_temp_high is None:
-            self._seed_bounds(source_temp)
+            self._seed_bounds(temperature)
 
     def _seed_bounds(self, anchor: float | None) -> None:
         """Derive both bounds from a single anchor temperature."""
@@ -807,19 +842,22 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             await self._async_enter_heat_cool()
             return
 
-        previous = self._attr_hvac_mode
         self._cancel_pending_flip()
         self._attr_hvac_mode = hvac_mode
         if hvac_mode not in (HVACMode.OFF, HVACMode.FAN_ONLY, HVACMode.DRY):
-            # Leaving heat_cool keeps the bound the new mode owns: the low
-            # setpoint carries into heat, the high setpoint carries into cool.
-            if previous == HVACMode.HEAT_COOL:
-                if hvac_mode == HVACMode.HEAT and self._target_temp_low is not None:
-                    self._target_temp = self._target_temp_low
-                elif hvac_mode == HVACMode.COOL and self._target_temp_high is not None:
-                    self._target_temp = self._target_temp_high
+            # Each mode applies the setpoint its side remembers: heat owns
+            # the low bound, cool the high bound. Switching modes never
+            # drags the other mode's setpoint along with it.
+            remembered = (
+                self._target_temp_low
+                if hvac_mode == HVACMode.HEAT
+                else self._target_temp_high
+            )
+            if remembered is not None:
+                self._target_temp = remembered
             if self._target_temp is None:
                 self._target_temp = (self.min_temp + self.max_temp) / 2
+            self._apply_bound(self._target_temp)
             await self._async_command(hvac_mode, self._target_temp)
         else:
             await self._async_command(hvac_mode, None)
@@ -827,43 +865,22 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
 
     async def _async_enter_heat_cool(self) -> None:
         """Switch into heat_cool and apply the decision immediately."""
-        previous = self._attr_hvac_mode
         self._attr_hvac_mode = HVACMode.HEAT_COOL
         self._cancel_pending_flip()
 
+        # Both remembered setpoints apply as-is: the pair has been kept
+        # current through every single-setpoint edit.
         if self._target_temp_low is None or self._target_temp_high is None:
             source_temp = self._source_target()
             if source_temp is None:
                 source_temp = self._target_temp
             self._seed_bounds(source_temp)
-        else:
-            self._align_bounds(previous)
 
         # Entering is not subject to min_cycle_time.
         await self._async_evaluate(gate_flips=False)
         if self._last_flip is None:
             self._last_flip = dt_util.utcnow()
         self.async_write_ha_state()
-
-    def _align_bounds(self, previous: HVACMode | None) -> None:
-        """Move the single setpoint into the bound its previous mode owns."""
-        temp = self._target_temp
-        if (
-            temp is None
-            or self._target_temp_low is None
-            or self._target_temp_high is None
-        ):
-            return
-        if previous == HVACMode.HEAT:
-            if abs(self._target_temp_low - temp) <= GAP_EPSILON:
-                return
-            high = max(self._target_temp_high, temp + self._min_gap)
-            self._target_temp_low, self._target_temp_high = self._normalize(temp, high)
-        elif previous == HVACMode.COOL:
-            if abs(self._target_temp_high - temp) <= GAP_EPSILON:
-                return
-            low = min(self._target_temp_low, temp - self._min_gap)
-            self._target_temp_low, self._target_temp_high = self._normalize(low, temp)
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Handle a temperature change, enforcing the minimum gap."""
@@ -920,8 +937,8 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
                 )
             return
 
+        self._apply_bound(temperature)
         self._target_temp = temperature
-        self._reconcile_bounds(temperature)
         await self._async_command(self._attr_hvac_mode or HVACMode.HEAT, temperature)
         self.async_write_ha_state()
 

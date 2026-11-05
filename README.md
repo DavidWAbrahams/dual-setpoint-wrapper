@@ -22,6 +22,10 @@ that drives it behind the scenes.
   current temperature against the midpoint of the two bounds:
   - below the midpoint → the source is commanded to `heat` with the low bound;
   - above the midpoint → the source is commanded to `cool` with the high bound.
+- **Two remembered setpoints:** the wrapper quietly keeps a heating *and* a
+  cooling setpoint at all times. `heat` applies and edits the low one, `cool`
+  applies and edits the high one, and `heat_cool` uses both — switching modes
+  never carries one mode's setpoint into the other.
 - **Compressor protection:** a flip between heating and cooling is deferred
   until `min_cycle_time` has elapsed since the last flip, then applied
   automatically.

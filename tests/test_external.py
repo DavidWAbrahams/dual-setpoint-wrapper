@@ -170,5 +170,7 @@ async def test_unconfirmed_command_mirrors_source_after_settle_window(
     assert state is not None
     assert state.attributes[ATTR_TEMPERATURE] == 21.0
     assert state.attributes[ATTR_TARGET_TEMP_LOW] == 21.0
-    assert state.attributes[ATTR_TARGET_TEMP_HIGH] == 23.0
+    # The failed edit still moved the remembered cooling bound up to keep the
+    # gap; giving up on the command only re-reads the heating side.
+    assert state.attributes[ATTR_TARGET_TEMP_HIGH] == 25.0
     assert len(thermostat.set_temperature_calls) == 1

@@ -604,3 +604,67 @@ async def test_fan_mode_passes_through_to_source(
     await hass.async_block_till_done()
 
     assert seen == [{ATTR_ENTITY_ID: SOURCE_ENTITY, ATTR_FAN_MODE: "low"}]
+
+
+async def test_mode_switch_applies_remembered_setpoint(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity
+) -> None:
+    """Heat and cool each apply their own remembered setpoint, never a carry-over."""
+    await create_wrapper()
+    entity = wrapper_entity()
+
+    # Heat owns the low bound; the gap cascade keeps the cooling bound clear.
+    await entity.async_set_temperature(**{ATTR_TEMPERATURE: 22.0})
+    await hass.async_block_till_done()
+    assert entity._target_temp_low == 22.0
+    assert entity._target_temp_high == 24.0
+
+    # Cooling applies the remembered high setpoint, not the heat value.
+    await entity.async_set_hvac_mode(HVACMode.COOL)
+    await hass.async_block_till_done()
+    assert thermostat.set_temperature_calls[-1] == {
+        ATTR_ENTITY_ID: SOURCE_ENTITY,
+        ATTR_TEMPERATURE: 24.0,
+        ATTR_HVAC_MODE: HVACMode.COOL,
+    }
+
+    # Back to heat, the remembered low setpoint comes back with it.
+    await entity.async_set_hvac_mode(HVACMode.HEAT)
+    await hass.async_block_till_done()
+    assert thermostat.set_temperature_calls[-1] == {
+        ATTR_ENTITY_ID: SOURCE_ENTITY,
+        ATTR_TEMPERATURE: 22.0,
+        ATTR_HVAC_MODE: HVACMode.HEAT,
+    }
+
+
+async def test_single_mode_edits_only_move_their_own_bound(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity
+) -> None:
+    """A cool-mode edit never disturbs the remembered heating setpoint."""
+    await create_wrapper()
+    entity = wrapper_entity()
+
+    # Establish a heating setpoint of 20 alongside a cooling setpoint of 24.
+    await entity.async_set_temperature(
+        **{ATTR_TARGET_TEMP_LOW: 20.0, ATTR_TARGET_TEMP_HIGH: 24.0}
+    )
+    await hass.async_block_till_done()
+
+    await entity.async_set_hvac_mode(HVACMode.COOL)
+    await hass.async_block_till_done()
+
+    # A cool edit moves only the high bound.
+    await entity.async_set_temperature(**{ATTR_TEMPERATURE: 23.0})
+    await hass.async_block_till_done()
+    assert entity._target_temp_low == 20.0
+    assert entity._target_temp_high == 23.0
+
+    # Returning to heat commands the untouched heating setpoint.
+    await entity.async_set_hvac_mode(HVACMode.HEAT)
+    await hass.async_block_till_done()
+    assert thermostat.set_temperature_calls[-1] == {
+        ATTR_ENTITY_ID: SOURCE_ENTITY,
+        ATTR_TEMPERATURE: 20.0,
+        ATTR_HVAC_MODE: HVACMode.HEAT,
+    }
