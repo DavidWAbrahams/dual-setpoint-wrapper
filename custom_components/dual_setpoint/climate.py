@@ -36,6 +36,8 @@ from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_FRIENDLY_NAME,
     ATTR_SUPPORTED_FEATURES,
+    PRECISION_HALVES,
+    PRECISION_TENTHS,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
     UnitOfTemperature,
@@ -65,6 +67,8 @@ from .const import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import CALLBACK_TYPE, HomeAssistant, State
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -76,6 +80,25 @@ _FALLBACK_LIMITS = {
 }
 
 UNAVAILABLE_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
+
+# Core rounds displayed temperatures to the entity's precision, and its default
+# precision for Fahrenheit systems is whole degrees. A Celsius-native source
+# (e.g. an ESPHome CN105) still publishes half- or tenth-degree Fahrenheit
+# readings though, so those would collapse to integers on our face. Any
+# fractional value among the source's own published temperatures tells us the
+# source displays finer than whole degrees, and we match it.
+_PRECISION_PROBE_ATTRS = (
+    ATTR_CURRENT_TEMPERATURE,
+    ATTR_TEMPERATURE,
+    ATTR_TARGET_TEMP_HIGH,
+    ATTR_TARGET_TEMP_LOW,
+)
+
+# Slack for deciding a fraction lands exactly on a display step.
+_PRECISION_EPSILON = 1e-6
+
+# Core's display steps, coarsest fractional to finest.
+_PRECISION_STEPS = (PRECISION_HALVES, PRECISION_TENTHS)
 
 _MIRRORED_FEATURES = (
     ClimateEntityFeature.FAN_MODE,
@@ -96,6 +119,37 @@ def _as_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return result
+
+
+def _observed_precision(values: Iterable[Any]) -> float | None:
+    """
+    Return the finest core precision that displays the values unchanged.
+
+    Core only rounds displayed temperatures to whole, half, or tenth degrees.
+    A value with no fractional part carries no information; a value like 71.5
+    needs halves, and one like 71.3 needs tenths. Returns None when none of
+    the values are fractional.
+    """
+    needed: float | None = None
+    for value in values:
+        number = _as_float(value)
+        if number is None:
+            continue
+        fraction = abs(number) % 1
+        if fraction <= _PRECISION_EPSILON or fraction >= 1 - _PRECISION_EPSILON:
+            continue
+        # Off-grid fractions keep the most detail at the finest step.
+        finest = next(
+            (
+                step
+                for step in _PRECISION_STEPS
+                if abs(round(fraction / step) * step - fraction) <= _PRECISION_EPSILON
+            ),
+            _PRECISION_STEPS[-1],
+        )
+        if needed is None or finest < needed:
+            needed = finest
+    return needed
 
 
 class DualSetpointClimate(ClimateEntity, RestoreEntity):
@@ -238,6 +292,24 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
     def current_temperature(self) -> float | None:
         """Mirror the source reading."""
         return _as_float(self._source_attributes.get(ATTR_CURRENT_TEMPERATURE))
+
+    @property
+    def precision(self) -> float:
+        """
+        Match the precision the source itself displays.
+
+        Core defaults to whole degrees on Fahrenheit systems, which would
+        flatten the half-degree readings a Celsius-native source publishes in
+        Fahrenheit. When the source's own published temperatures show finer
+        fractions, round no more coarsely than the source does.
+        """
+        default = super().precision
+        observed = _observed_precision(
+            self._source_attributes.get(attr) for attr in _PRECISION_PROBE_ATTRS
+        )
+        if observed is not None and observed < default:
+            return observed
+        return default
 
     @property
     def hvac_action(self) -> HVACAction | None:

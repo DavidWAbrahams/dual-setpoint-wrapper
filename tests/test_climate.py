@@ -20,9 +20,16 @@ from homeassistant.components.climate import (
     HVACAction,
     HVACMode,
 )
-from homeassistant.const import ATTR_ENTITY_ID, ATTR_SUPPORTED_FEATURES
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    ATTR_SUPPORTED_FEATURES,
+    PRECISION_HALVES,
+    PRECISION_TENTHS,
+    PRECISION_WHOLE,
+)
 from homeassistant.core import HomeAssistant, ServiceCall, State
 from homeassistant.util import dt as dt_util
+from homeassistant.util.unit_system import US_CUSTOMARY_SYSTEM
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from .conftest import SOURCE_ENTITY
@@ -96,6 +103,50 @@ async def test_mirrored_surface_tracks_source_attributes(
     state = hass.states.get(wrapper_id())
     assert state is not None
     assert state.attributes["current_temperature"] == 18.5
+
+
+async def test_imperial_half_degree_source_reading_survives(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_id, wrapper_entity
+) -> None:
+    """A half-degree source reading is not flattened on a Fahrenheit system."""
+    hass.config.units = US_CUSTOMARY_SYSTEM
+    await create_wrapper()
+
+    # Core would default us to whole-degree precision in Fahrenheit and round
+    # 71.5 up to 72; the source publishing 71.5 tells the wrapper to match it.
+    thermostat.external_set(current=71.5)
+    await hass.async_block_till_done()
+
+    assert wrapper_entity().precision == PRECISION_HALVES
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.attributes["current_temperature"] == 71.5
+
+
+async def test_imperial_tenth_degree_source_reading_survives(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_id, wrapper_entity
+) -> None:
+    """A tenth-degree source reading keeps tenth precision in Fahrenheit."""
+    hass.config.units = US_CUSTOMARY_SYSTEM
+    await create_wrapper()
+
+    thermostat.external_set(current=71.3)
+    await hass.async_block_till_done()
+
+    assert wrapper_entity().precision == PRECISION_TENTHS
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.attributes["current_temperature"] == 71.3
+
+
+async def test_imperial_whole_source_readings_keep_whole_precision(
+    hass: HomeAssistant, create_wrapper, wrapper_entity
+) -> None:
+    """Integer source readings leave core's whole-degree default alone."""
+    hass.config.units = US_CUSTOMARY_SYSTEM
+    await create_wrapper()
+
+    assert wrapper_entity().precision == PRECISION_WHOLE
 
 
 async def test_availability_follows_source(

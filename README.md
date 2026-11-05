@@ -22,10 +22,6 @@ that drives it behind the scenes.
   current temperature against the midpoint of the two bounds:
   - below the midpoint → the source is commanded to `heat` with the low bound;
   - above the midpoint → the source is commanded to `cool` with the high bound.
-- **Setpoint carry-over:** leaving `heat_cool` for `heat` keeps the lower bound
-  as the single setpoint; leaving it for `cool` keeps the upper bound. Going the
-  other way, the single setpoint from `heat`/`cool` becomes the lower/upper
-  bound of the range.
 - **Compressor protection:** a flip between heating and cooling is deferred
   until `min_cycle_time` has elapsed since the last flip, then applied
   automatically.
