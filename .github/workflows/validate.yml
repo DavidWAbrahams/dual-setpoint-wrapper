@@ -34,6 +34,8 @@ jobs:
         uses: hacs/action@d556e736723344f83838d08488c983a15381059a # 22.5.0
         with:
           category: integration
-          # Remove this 'ignore' key when you have added brand images for your integration
+          # Brand images ship locally in custom_components/dual_setpoint/brand/,
+          # but this pinned action predates local brand images (HA 2026.3+), so
+          # the 'ignore' key stays until hacs/action learns about them.
           # https://developers.home-assistant.io/docs/creating_integration_file_structure#local-brand-images-for-custom-integrations
           ignore: brands

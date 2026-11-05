@@ -1,6 +1,10 @@
 # https://www.home-assistant.io/integrations/default_config/
 default_config:
 
+# https://www.home-assistant.io/integrations/demo/
+# Provides demo climate entities to wrap while developing.
+demo:
+
 # https://www.home-assistant.io/integrations/homeassistant/
 homeassistant:
   debug: true
@@ -9,4 +13,4 @@ homeassistant:
 logger:
   default: info
   logs:
-    custom_components.integration_blueprint: debug
+    custom_components.dual_setpoint: debug

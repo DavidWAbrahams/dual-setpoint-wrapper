@@ -5,12 +5,16 @@ __pycache__
 */build/*
 */dist/*
 
+# local development AI cruft
+research/
+plans/
 
 # misc
 .coverage
 .vscode
 coverage.xml
 .ruff_cache
+pipinstall.log
 
 
 # Home Assistant configuration

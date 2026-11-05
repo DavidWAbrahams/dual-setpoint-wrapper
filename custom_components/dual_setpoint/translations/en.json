@@ -1,0 +1,37 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "title": "Dual setpoint",
+                "description": "Pick the single-setpoint climate entity to wrap. It must support both heat and cool.",
+                "data": {
+                    "source": "Climate entity"
+                }
+            },
+            "init": {
+                "title": "Dual setpoint options",
+                "data": {
+                    "min_gap": "Minimum gap between the low and high setpoints",
+                    "min_cycle_time": "Minimum time between heat and cool changes"
+                },
+                "data_description": {
+                    "min_gap": "Keep this comfortably larger than your thermostat's overshoot, or the unit will heat and cool against itself.",
+                    "min_cycle_time": "How long the wrapper waits before flipping between heating and cooling."
+                }
+            }
+        },
+        "error": {
+            "source_not_found": "That entity does not exist yet.",
+            "source_not_dual": "That climate entity does not support both heat and cool."
+        },
+        "abort": {
+            "already_configured": "That climate entity is already wrapped.",
+            "circular": "A Dual Setpoint Climate entity cannot wrap another one."
+        }
+    },
+    "exceptions": {
+        "gap_too_small": {
+            "message": "The low and high setpoints must be at least {min_gap} {unit} apart. Widen them, or lower the minimum gap in the integration options."
+        }
+    }
+}

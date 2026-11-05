@@ -1,6 +1,12 @@
 # The contents of this file is based on https://github.com/home-assistant/core/blob/dev/pyproject.toml
 
-target-version = "py314"
+# Keep in step with the dev venv: py314 lets the formatter emit PEP 758
+# parenthesis-free except clauses that Python 3.13 cannot parse.
+target-version = "py313"
+
+exclude = [
+    "_winshim", # Windows-only stubs for POSIX modules, not project code
+]
 
 [lint]
 select = [
@@ -13,6 +19,23 @@ ignore = [
     "D212", # multi-line-summary-first-line (incompatible with formatter)
     "COM812", # incompatible with formatter
     "ISC001", # incompatible with formatter
+]
+
+[lint.per-file-ignores]
+"scripts/*" = [
+    "INP001", # the scripts directory is not a package
+    "T201", # scripts report progress with print
+]
+"tests/*" = [
+    "ANN", # test helpers do not need full annotations
+    "EM", # exception messages are fine to inline in tests
+    "FBT", # boolean flags read clearly in test fixtures
+    "INP001", # the tests directory is not a package
+    "PLR2004", # magic numbers are the point of a test
+    "S101", # assert is how pytest asserts
+    "SLF001", # tests reach into private state on purpose
+    "TC", # fixtures need their types at runtime
+    "TRY003", # long messages are fine in tests
 ]
 
 [lint.flake8-pytest-style]

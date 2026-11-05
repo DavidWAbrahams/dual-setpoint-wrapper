@@ -1,0 +1,132 @@
+# Copyright (C) 2026 Dual Setpoint Climate contributors
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for source changes made outside of the wrapper."""
+
+from __future__ import annotations
+
+from datetime import timedelta
+
+from homeassistant.components.climate import (
+    ATTR_HVAC_MODE,
+    ATTR_TARGET_TEMP_HIGH,
+    ATTR_TARGET_TEMP_LOW,
+    ATTR_TEMPERATURE,
+    HVACMode,
+)
+from homeassistant.const import ATTR_ENTITY_ID
+from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+from .conftest import SOURCE_ENTITY
+
+
+async def test_remote_turns_source_off_during_heat_cool(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity, wrapper_id
+) -> None:
+    """A remote power-off is adopted; the wrapper does not fight back."""
+    thermostat.current_temperature = 15.0
+    await create_wrapper()
+    entity = wrapper_entity()
+    await entity.async_set_hvac_mode(HVACMode.HEAT_COOL)
+    await hass.async_block_till_done()
+    assert thermostat.set_temperature_calls == []
+
+    thermostat.external_set(mode=HVACMode.OFF)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.state == HVACMode.OFF
+    # Still nothing commanded; we follow the source, never contradict it.
+    assert thermostat.set_temperature_calls == []
+    assert hass.states.get(SOURCE_ENTITY).state == HVACMode.OFF
+
+
+async def test_remote_switches_to_cool_during_heat_cool(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity, wrapper_id
+) -> None:
+    """A remote mode change exits heat_cool and re-anchors the bounds."""
+    thermostat.current_temperature = 15.0
+    await create_wrapper()
+    entity = wrapper_entity()
+    await entity.async_set_hvac_mode(HVACMode.HEAT_COOL)
+    await hass.async_block_till_done()
+
+    thermostat.external_set(mode=HVACMode.COOL)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.state == HVACMode.COOL
+    # Cooling at 21.0 re-anchors the range below the setpoint.
+    assert state.attributes[ATTR_TEMPERATURE] == 21.0
+    assert state.attributes[ATTR_TARGET_TEMP_LOW] == 19.0
+    assert state.attributes[ATTR_TARGET_TEMP_HIGH] == 21.0
+    assert thermostat.set_temperature_calls == []
+
+
+async def test_small_source_drift_is_not_out_of_band(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_id
+) -> None:
+    """Drift within one source step is ignored; a bigger jump is mirrored."""
+    await create_wrapper()
+
+    # Within the source's 1.0 step tolerance: treated as an echo, not news.
+    thermostat.external_set(temperature=21.5)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.attributes[ATTR_TEMPERATURE] == 21.0
+    assert state.attributes[ATTR_TARGET_TEMP_LOW] == 21.0
+    assert state.attributes[ATTR_TARGET_TEMP_HIGH] == 23.0
+    assert thermostat.set_temperature_calls == []
+
+    # Well past the tolerance: the source moved out of band, so we adopt it.
+    thermostat.external_set(temperature=24.0)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.attributes[ATTR_TEMPERATURE] == 24.0
+    assert state.attributes[ATTR_TARGET_TEMP_LOW] == 24.0
+    assert state.attributes[ATTR_TARGET_TEMP_HIGH] == 26.0
+    assert thermostat.set_temperature_calls == []
+
+
+async def test_unconfirmed_command_mirrors_source_after_settle_window(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity, wrapper_id
+) -> None:
+    """A command the source never confirms gives up once the window closes."""
+    await create_wrapper()
+    entity = wrapper_entity()
+
+    # The silent thermostat accepts the call but never echoes new state.
+    thermostat.echo = False
+    await entity.async_set_temperature(**{ATTR_TEMPERATURE: 23.0})
+    await hass.async_block_till_done()
+
+    assert thermostat.set_temperature_calls == [
+        {
+            ATTR_ENTITY_ID: SOURCE_ENTITY,
+            ATTR_TEMPERATURE: 23.0,
+            ATTR_HVAC_MODE: HVACMode.HEAT,
+        }
+    ]
+    # Until the source confirms, we show what we commanded.
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.attributes[ATTR_TEMPERATURE] == 23.0
+
+    # The settle window passes with no confirmation: the source stays real.
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=91))
+    await hass.async_block_till_done()
+
+    assert entity._pending is False
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.attributes[ATTR_TEMPERATURE] == 21.0
+    assert state.attributes[ATTR_TARGET_TEMP_LOW] == 21.0
+    assert state.attributes[ATTR_TARGET_TEMP_HIGH] == 23.0
+    assert len(thermostat.set_temperature_calls) == 1

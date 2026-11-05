@@ -1,60 +1,91 @@
-# Notice
+# Dual Setpoint Climate
 
-The component and platforms in this repository are not meant to be used by a
-user, but as a "blueprint" that custom component developers can build
-upon, to make more awesome stuff.
+Expose native `heat_cool` (a heating setpoint *and* a cooling setpoint) on top
+of any Home Assistant climate entity that only supports a single setpoint.
 
-HAVE FUN! 😎
+Many thermostats and HVAC integrations expose just one target temperature with
+`heat`/`cool`/`off` modes. Home Assistant's thermostat cards, schedules, and
+automations are much nicer when the entity supports `heat_cool` with
+`target_temp_low`/`target_temp_high`. This integration is a *helper*: it wraps
+one such "source" entity and presents a complete dual-setpoint climate entity
+that drives it behind the scenes.
 
-## Why?
+## How it works
 
-This is simple, by having custom_components look (README + structure) the same
-it is easier for developers to help each other and for users to start using them.
+- The wrapper mirrors the source entity: availability, min/max temperature,
+  target-temp step, fan modes, swing modes, preset modes, and the current
+  temperature all come straight from the source.
+- In `heat`/`cool`/`off` the wrapper passes through to the source like a normal
+  single-setpoint climate entity.
+- In `heat_cool` you set a lower and an upper bound. The wrapper compares the
+  current temperature against the midpoint of the two bounds:
+  - below the midpoint → the source is commanded to `heat` with the low bound;
+  - above the midpoint → the source is commanded to `cool` with the high bound.
+- **Compressor protection:** a flip between heating and cooling is deferred
+  until `min_cycle_time` has elapsed since the last flip, then applied
+  automatically.
+- **Out-of-band awareness:** if the source is changed remotely (vendor app,
+  cloud, another automation), the wrapper follows that change and leaves
+  `heat_cool` rather than fighting it. A short settle window absorbs stale
+  polls and per-mode setpoint echoes right after a mode change.
+- The wrapper's own state (mode, bounds, last flip time) survives restarts via
+  Home Assistant's restore mechanism.
 
-If you are a developer and you want to add things to this "blueprint" that you think more
-developers will have use for, please open a PR to add it :)
+## Installation
 
-## What?
+1. Install [HACS](https://hacs.xyz/).
+2. Add this repository as a custom repository (category: *Integration*) or use
+   the default repo listing once published.
+3. Install **Dual Setpoint Climate** and restart Home Assistant.
+4. Go to *Settings → Devices & Services → Add Integration → Dual Setpoint
+   Climate* and pick the source climate entity to wrap.
 
-This repository contains multiple files, here is a overview:
+## Configuration options
 
-File | Purpose | Documentation
--- | -- | --
-`.devcontainer.json` | Used for development/testing with Visual Studio Code. | [Documentation](https://code.visualstudio.com/docs/remote/containers)
-`.github/renovate.json` | Dependency update configuration for Renovate (enabled by default). | [Documentation](https://docs.renovatebot.com/configuration-options/)
-`.github/_dependabot.yml` | Dependency update configuration for Dependabot (disabled, see "Dependency updates" below). | [Documentation](https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file)
-`.github/ISSUE_TEMPLATE/*.yml` | Templates for the issue tracker | [Documentation](https://help.github.com/en/github/building-a-strong-community/configuring-issue-templates-for-your-repository)
-`custom_components/integration_blueprint/*` | Integration files, this is where everything happens. | [Documentation](https://developers.home-assistant.io/docs/creating_component_index)
-`CONTRIBUTING.md` | Guidelines on how to contribute. | [Documentation](https://help.github.com/en/github/building-a-strong-community/setting-guidelines-for-repository-contributors)
-`LICENSE` | The license file for the project. | [Documentation](https://help.github.com/en/github/creating-cloning-and-archiving-repositories/licensing-a-repository)
-`README.md` | The file you are reading now, should contain info about the integration, installation and configuration instructions. | [Documentation](https://help.github.com/en/github/writing-on-github/basic-writing-and-formatting-syntax)
-`requirements_dev.txt` | Python packages used for development/testing this integration (also installs lint tooling via `requirements_lint.txt`). | [Documentation](https://pip.pypa.io/en/stable/user_guide/#requirements-files)
-`requirements_lint.txt` | Python packages used to lint this integration (installed by the Lint CI job). | [Documentation](https://pip.pypa.io/en/stable/user_guide/#requirements-files)
-`requirements_common.txt` | Python packages common to CI and local dev, installed first so any pip upgrade completes before other dependencies (e.g. a modern pip). | [Documentation](https://pip.pypa.io/en/stable/user_guide/#requirements-files)
+| Option | Meaning |
+| -- | -- |
+| **Source entity** | The single-setpoint climate entity to wrap. |
+| **Minimum gap** | Smallest allowed distance between the low and high setpoints. Ranges closer together than this are rejected. Defaults to 2.0 °C (metric) or 4.0 °F (imperial). |
+| **Minimum cycle time** | How long to wait before flipping the source between heating and cooling. Defaults to 15 minutes. |
 
-## Dependency updates
+Options can be changed later from the integration's entry (⋮ → *Configure*).
 
-This template ships with configuration for **two** dependency update tools. Pick
-**one** and remove or disable the other:
+### Gap guidance
 
-- **Renovate** (`.github/renovate.json`) is enabled by default.
-- **Dependabot** (`.github/_dependabot.yml`) is included but disabled — the `_`
-  prefix means GitHub ignores it. To use Dependabot instead, rename the file
-  back to `.github/dependabot.yml` and delete `.github/renovate.json`.
+`min_gap` only rejects *requests* that are too tight — it cannot change your
+hardware. If your low/high bounds are so close that normal thermostat
+overshoot carries the temperature past the midpoint, the wrapper will flip back
+and forth and the unit will fight itself. Set the bounds, and `min_gap`,
+comfortably farther apart than your equipment's overshoot so the temperature
+has room to settle before the other side becomes active.
 
-## How?
+## Development
 
-1. Create a new repository in GitHub, using this repository as a template by clicking the "Use this template" button in the GitHub UI.
-1. Open your new repository in Visual Studio Code devcontainer (Preferably with the "`Dev Containers: Clone Repository in Named Container Volume...`" option).
-1. Rename all instances of the `integration_blueprint` to `custom_components/<your_integration_domain>` (e.g. `custom_components/awesome_integration`).
-1. Rename all instances of the `Integration Blueprint` to `<Your Integration Name>` (e.g. `Awesome Integration`).
-1. Run the `scripts/develop` to start HA and test out your new integration.
+This repository started as the
+[`integration_blueprint`](https://github.com/ludeeus/integration_blueprint)
+template.
 
-## Next steps
+- `custom_components/dual_setpoint/` — the integration itself.
+- `tests/` — pytest suite (`pytest-homeassistant-custom-component`); run with
+  `python -m pytest tests/ -q`.
+- `scripts/develop` — start Home Assistant with this integration loaded
+  (the dev config enables `demo:` so there are climate entities to wrap).
+- Linting uses [ruff](https://docs.astral.sh/ruff/): `python -m ruff check .`
+  and `python -m ruff format .`.
+- `scripts/generate_brand_images.py` regenerates the brand images
+  (dial with two setpoints) written to
+  `custom_components/dual_setpoint/brand/`.
 
-These are some next steps you may want to look into:
-- Add tests to your integration, [`pytest-homeassistant-custom-component`](https://github.com/MatthewFlamm/pytest-homeassistant-custom-component) can help you get started.
-- Add brand images (logo/icon).
-- Create your first release.
-- Share your integration on the [Home Assistant Forum](https://community.home-assistant.io/).
-- Submit your integration to [HACS](https://hacs.xyz/docs/publish/start).
+### Brand images
+
+Since Home Assistant 2026.3 an integration can ship its own icon and logo in
+`custom_components/dual_setpoint/brand/`; Home Assistant serves them
+automatically and they take priority over the
+[brands](https://github.com/home-assistant/brands) repository, so no extra
+configuration is needed. The images here are generated with
+`python scripts/generate_brand_images.py` (requires Pillow, already a Home
+Assistant dependency).
+
+`ignore: brands` stays in `.github/workflows/validate.yml` only because the
+pinned HACS validation action predates local brand images; a companion PR to
+the brands repository remains optional.
