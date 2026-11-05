@@ -484,8 +484,20 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         return low, high
 
     def _step_tolerance(self) -> float:
-        """Return the drift we tolerate before calling a change out-of-band."""
-        return _as_float(self._source_attributes.get(ATTR_TARGET_TEMP_STEP)) or 1.0
+        """
+        Return the drift we absorb before calling a change deliberate.
+
+        Devices that quantize setpoints to their own grid (a Celsius-native
+        device handed a Fahrenheit target) echo back within half a step of
+        what we sent, so that much drift reads as our own command returning.
+        A whole step, though, is exactly what a user picks on a dial: with a
+        full step as the tolerance a one-step command was judged already
+        matched and never sent, and a one-step external change was judged
+        noise and never mirrored. The tolerance therefore stays under one
+        step.
+        """
+        step = _as_float(self._source_attributes.get(ATTR_TARGET_TEMP_STEP)) or 1.0
+        return step / 2
 
     def _source_target(self) -> float | None:
         """Return the source's active single setpoint."""

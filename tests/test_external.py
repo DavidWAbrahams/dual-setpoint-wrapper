@@ -69,10 +69,10 @@ async def test_remote_switches_to_cool_during_heat_cool(
 async def test_small_source_drift_is_not_out_of_band(
     hass: HomeAssistant, thermostat, create_wrapper, wrapper_id
 ) -> None:
-    """Drift within one source step is ignored; a bigger jump is mirrored."""
+    """Drift within half a source step is ignored; a bigger jump is mirrored."""
     await create_wrapper()
 
-    # Within the source's 1.0 step tolerance: treated as an echo, not news.
+    # Within the half-step echo tolerance: treated as an echo, not news.
     thermostat.external_set(temperature=21.5)
     await hass.async_block_till_done()
 
@@ -93,6 +93,48 @@ async def test_small_source_drift_is_not_out_of_band(
     assert state.attributes[ATTR_TARGET_TEMP_LOW] == 24.0
     assert state.attributes[ATTR_TARGET_TEMP_HIGH] == 26.0
     assert thermostat.set_temperature_calls == []
+
+
+async def test_one_step_source_change_is_out_of_band(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_id
+) -> None:
+    """A deliberate one-step move on the source is news, not echo noise."""
+    await create_wrapper()  # source heats at 21.0 with a 1.0 step
+
+    thermostat.external_set(temperature=22.0)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.attributes[ATTR_TEMPERATURE] == 22.0
+    assert state.attributes[ATTR_TARGET_TEMP_LOW] == 22.0
+    assert state.attributes[ATTR_TARGET_TEMP_HIGH] == 24.0
+    assert thermostat.set_temperature_calls == []
+
+
+async def test_grid_rounded_echo_confirms_command(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity, wrapper_id
+) -> None:
+    """An echo landed within half a step of what we sent confirms it."""
+    await create_wrapper()
+    entity = wrapper_entity()
+
+    thermostat.echo = False
+    await entity.async_set_temperature(**{ATTR_TEMPERATURE: 23.0})
+    await hass.async_block_till_done()
+    assert entity._pending is True
+
+    # A device quantizing setpoints to its own (e.g. Celsius) grid echoes a
+    # hair below what we sent; that still reads as our command returning,
+    # and the wrapper keeps showing the value the user picked.
+    thermostat.external_set(temperature=22.55)
+    await hass.async_block_till_done()
+
+    assert entity._pending is False
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.attributes[ATTR_TEMPERATURE] == 23.0
+    assert len(thermostat.set_temperature_calls) == 1
 
 
 async def test_unconfirmed_command_mirrors_source_after_settle_window(

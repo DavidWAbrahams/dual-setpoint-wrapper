@@ -8,13 +8,14 @@ from datetime import timedelta
 
 import pytest
 from homeassistant.components.climate import (
+    ATTR_HVAC_MODE,
     ATTR_TARGET_TEMP_HIGH,
     ATTR_TARGET_TEMP_LOW,
     ATTR_TEMPERATURE,
     HVACMode,
 )
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.const import STATE_UNAVAILABLE
+from homeassistant.const import ATTR_ENTITY_ID, STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.util import dt as dt_util
@@ -99,8 +100,15 @@ async def test_restore_heat_cool_normalizes_gap_and_keeps_flip_clock(
     # The 1.0 gap was widened back out to the configured 2.0.
     assert state.attributes[ATTR_TARGET_TEMP_HIGH] == 22.0
     assert state.attributes["last_flip"] == flip.isoformat()
-    # Cold room, heat already wanted, source already heating: nothing to send.
-    assert thermostat.set_temperature_calls == []
+    # Cold room, heat already wanted; the source heats a full step away from
+    # the restored low bound, so we re-assert the restored setpoint.
+    assert thermostat.set_temperature_calls == [
+        {
+            ATTR_ENTITY_ID: SOURCE_ENTITY,
+            ATTR_TEMPERATURE: 20.0,
+            ATTR_HVAC_MODE: HVACMode.HEAT,
+        }
+    ]
 
 
 async def test_restore_heat_cool_recommands_hot_source(
