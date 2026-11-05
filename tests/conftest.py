@@ -28,6 +28,7 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
 )
 from homeassistant.core import HomeAssistant, ServiceCall, State
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
@@ -77,12 +78,16 @@ class FakeThermostat:
         self.online: bool = True
         self.echo: bool = True
         self.set_temperature_calls: list[dict[str, Any]] = []
+        self.set_hvac_mode_calls: list[dict[str, Any]] = []
         self.register_service()
 
     def register_service(self) -> None:
-        """(Re-)register the climate.set_temperature handler we answer to."""
+        """(Re-)register the climate services we answer to."""
         self.hass.services.async_register(
             "climate", "set_temperature", self._async_handle_set_temperature
+        )
+        self.hass.services.async_register(
+            "climate", "set_hvac_mode", self._async_handle_set_hvac_mode
         )
 
     @property
@@ -133,10 +138,29 @@ class FakeThermostat:
     async def _async_handle_set_temperature(self, call: ServiceCall) -> None:
         """Answer the service call the wrapper sends and echo new state."""
         self.set_temperature_calls.append(dict(call.data))
+        # Core's schema requires a setpoint here, mirroring that keeps the
+        # fake honest about services the wrapper must not call bare.
+        if not any(
+            key in call.data
+            for key in (ATTR_TEMPERATURE, "target_temp_high", "target_temp_low")
+        ):
+            msg = (
+                "at least one of ['temperature', 'target_temp_high', "
+                "'target_temp_low'] was specified, and none were valid"
+            )
+            raise ServiceValidationError(msg)
         if (mode := call.data.get(ATTR_HVAC_MODE)) is not None:
             self.mode = HVACMode(mode)
         if (temperature := call.data.get(ATTR_TEMPERATURE)) is not None:
             self.temperature = float(temperature)
+        if self.echo:
+            self._push()
+
+    async def _async_handle_set_hvac_mode(self, call: ServiceCall) -> None:
+        """Answer a mode-only command and echo new state."""
+        self.set_hvac_mode_calls.append(dict(call.data))
+        if (mode := call.data.get(ATTR_HVAC_MODE)) is not None:
+            self.mode = HVACMode(mode)
         if self.echo:
             self._push()
 

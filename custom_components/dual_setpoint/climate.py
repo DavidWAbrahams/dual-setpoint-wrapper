@@ -440,14 +440,20 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             return True
 
         data: dict[str, Any] = {ATTR_ENTITY_ID: self._source_entity_id}
+        data[ATTR_HVAC_MODE] = mode
         if temperature is not None:
             data[ATTR_TEMPERATURE] = temperature
-        data[ATTR_HVAC_MODE] = mode
+            service = "set_temperature"
+        else:
+            # Mode-only changes (off, fan_only, dry) must go through
+            # set_hvac_mode: core's set_temperature schema requires at
+            # least one setpoint field and rejects the call without one.
+            service = "set_hvac_mode"
 
         try:
             await self.hass.services.async_call(
                 "climate",
-                "set_temperature",
+                service,
                 data,
                 blocking=True,
                 context=self._context,

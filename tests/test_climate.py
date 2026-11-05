@@ -356,7 +356,7 @@ async def test_single_setpoint_in_heat_cool_follows_cooling_side(
 async def test_leave_heat_cool_to_off(
     hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity
 ) -> None:
-    """Leaving heat_cool for off commands the source without a setpoint."""
+    """Leaving heat_cool for off uses set_hvac_mode, never bare set_temperature."""
     await create_wrapper()
     entity = wrapper_entity()
     await entity.async_set_hvac_mode(HVACMode.HEAT_COOL)
@@ -365,9 +365,10 @@ async def test_leave_heat_cool_to_off(
     await entity.async_set_hvac_mode(HVACMode.OFF)
     await hass.async_block_till_done()
 
-    assert thermostat.set_temperature_calls == [
+    assert thermostat.set_hvac_mode_calls == [
         {ATTR_ENTITY_ID: SOURCE_ENTITY, ATTR_HVAC_MODE: HVACMode.OFF}
     ]
+    assert all(ATTR_TEMPERATURE in call for call in thermostat.set_temperature_calls)
     assert hass.states.get(SOURCE_ENTITY).state == HVACMode.OFF
     assert hass.states.get(entity.entity_id).state == HVACMode.OFF
 
