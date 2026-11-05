@@ -711,9 +711,17 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             await self._async_enter_heat_cool()
             return
 
+        previous = self._attr_hvac_mode
         self._cancel_pending_flip()
         self._attr_hvac_mode = hvac_mode
         if hvac_mode not in (HVACMode.OFF, HVACMode.FAN_ONLY, HVACMode.DRY):
+            # Leaving heat_cool keeps the bound the new mode owns: the low
+            # setpoint carries into heat, the high setpoint carries into cool.
+            if previous == HVACMode.HEAT_COOL:
+                if hvac_mode == HVACMode.HEAT and self._target_temp_low is not None:
+                    self._target_temp = self._target_temp_low
+                elif hvac_mode == HVACMode.COOL and self._target_temp_high is not None:
+                    self._target_temp = self._target_temp_high
             if self._target_temp is None:
                 self._target_temp = (self.min_temp + self.max_temp) / 2
             await self._async_command(hvac_mode, self._target_temp)
@@ -723,6 +731,7 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
 
     async def _async_enter_heat_cool(self) -> None:
         """Switch into heat_cool and apply the decision immediately."""
+        previous = self._attr_hvac_mode
         self._attr_hvac_mode = HVACMode.HEAT_COOL
         self._cancel_pending_flip()
 
@@ -731,12 +740,34 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             if source_temp is None:
                 source_temp = self._target_temp
             self._seed_bounds(source_temp)
+        else:
+            self._align_bounds(previous)
 
         # Entering is not subject to min_cycle_time.
         await self._async_evaluate(gate_flips=False)
         if self._last_flip is None:
             self._last_flip = dt_util.utcnow()
         self.async_write_ha_state()
+
+    def _align_bounds(self, previous: HVACMode | None) -> None:
+        """Move the single setpoint into the bound its previous mode owns."""
+        temp = self._target_temp
+        if (
+            temp is None
+            or self._target_temp_low is None
+            or self._target_temp_high is None
+        ):
+            return
+        if previous == HVACMode.HEAT:
+            if abs(self._target_temp_low - temp) <= GAP_EPSILON:
+                return
+            high = max(self._target_temp_high, temp + self._min_gap)
+            self._target_temp_low, self._target_temp_high = self._normalize(temp, high)
+        elif previous == HVACMode.COOL:
+            if abs(self._target_temp_high - temp) <= GAP_EPSILON:
+                return
+            low = min(self._target_temp_low, temp - self._min_gap)
+            self._target_temp_low, self._target_temp_high = self._normalize(low, temp)
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Handle a temperature change, enforcing the minimum gap."""
@@ -769,8 +800,10 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         self._target_temp_low, self._target_temp_high = self._normalize(low, high)
 
         if self._attr_hvac_mode == HVACMode.HEAT:
+            self._target_temp = self._target_temp_low
             await self._async_command(HVACMode.HEAT, self._target_temp_low)
         elif self._attr_hvac_mode == HVACMode.COOL:
+            self._target_temp = self._target_temp_high
             await self._async_command(HVACMode.COOL, self._target_temp_high)
         elif self._attr_hvac_mode == HVACMode.HEAT_COOL:
             await self._async_evaluate(gate_flips=True)

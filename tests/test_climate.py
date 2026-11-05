@@ -21,7 +21,7 @@ from homeassistant.components.climate import (
     HVACMode,
 )
 from homeassistant.const import ATTR_ENTITY_ID, ATTR_SUPPORTED_FEATURES
-from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.core import HomeAssistant, ServiceCall, State
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
@@ -351,6 +351,134 @@ async def test_single_setpoint_in_heat_cool_follows_cooling_side(
     assert state is not None
     assert state.attributes[ATTR_TARGET_TEMP_LOW] == 21.0
     assert state.attributes[ATTR_TARGET_TEMP_HIGH] == 24.0
+
+
+async def test_leave_heat_cool_to_heat_keeps_low_bound(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity
+) -> None:
+    """Leaving heat_cool for heat carries the low setpoint out as the target."""
+    thermostat.step = 0.5
+    thermostat.current_temperature = 25.0
+    await create_wrapper(min_cycle=0)
+    entity = wrapper_entity()
+    # Hot room: entering drives the source to cooling at the high bound.
+    await entity.async_set_hvac_mode(HVACMode.HEAT_COOL)
+    await hass.async_block_till_done()
+    assert hass.states.get(SOURCE_ENTITY).state == HVACMode.COOL
+
+    await entity.async_set_hvac_mode(HVACMode.HEAT)
+    await hass.async_block_till_done()
+
+    # The low bound, not the cooling setpoint the source last held, is sent.
+    assert thermostat.set_temperature_calls[-1] == {
+        ATTR_ENTITY_ID: SOURCE_ENTITY,
+        ATTR_TEMPERATURE: 21.0,
+        ATTR_HVAC_MODE: HVACMode.HEAT,
+    }
+    state = hass.states.get(entity.entity_id)
+    assert state is not None
+    assert state.state == HVACMode.HEAT
+    assert state.attributes[ATTR_TEMPERATURE] == 21.0
+
+
+async def test_leave_heat_cool_to_cool_keeps_high_bound(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity
+) -> None:
+    """Leaving heat_cool for cool carries the high setpoint out as the target."""
+    thermostat.step = 0.5
+    thermostat.current_temperature = 15.0
+    await create_wrapper(min_cycle=0)
+    entity = wrapper_entity()
+    # Cold room on heat: entering commands nothing, source heats at the low bound.
+    await entity.async_set_hvac_mode(HVACMode.HEAT_COOL)
+    await hass.async_block_till_done()
+    assert thermostat.set_temperature_calls == []
+
+    await entity.async_set_hvac_mode(HVACMode.COOL)
+    await hass.async_block_till_done()
+
+    # The high bound, not the heating setpoint the source last held, is sent.
+    assert thermostat.set_temperature_calls == [
+        {
+            ATTR_ENTITY_ID: SOURCE_ENTITY,
+            ATTR_TEMPERATURE: 23.0,
+            ATTR_HVAC_MODE: HVACMode.COOL,
+        }
+    ]
+    state = hass.states.get(entity.entity_id)
+    assert state is not None
+    assert state.state == HVACMode.COOL
+    assert state.attributes[ATTR_TEMPERATURE] == 23.0
+
+
+async def test_enter_heat_cool_from_heat_keeps_wide_gap(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity
+) -> None:
+    """A wide range set while heating survives the round trip into heat_cool."""
+    thermostat.step = 0.5
+    await create_wrapper(min_cycle=0)
+    entity = wrapper_entity()
+
+    # In heat, a range edit drives the source to the low side.
+    await entity.async_set_temperature(
+        **{ATTR_TARGET_TEMP_LOW: 20.0, ATTR_TARGET_TEMP_HIGH: 24.0}
+    )
+    await hass.async_block_till_done()
+    assert thermostat.set_temperature_calls == [
+        {
+            ATTR_ENTITY_ID: SOURCE_ENTITY,
+            ATTR_TEMPERATURE: 20.0,
+            ATTR_HVAC_MODE: HVACMode.HEAT,
+        }
+    ]
+    state = hass.states.get(entity.entity_id)
+    assert state is not None
+    assert state.attributes[ATTR_TEMPERATURE] == 20.0
+
+    # Entering heat_cool keeps both bounds; the source already heats at the low.
+    await entity.async_set_hvac_mode(HVACMode.HEAT_COOL)
+    await hass.async_block_till_done()
+    assert len(thermostat.set_temperature_calls) == 1
+    state = hass.states.get(entity.entity_id)
+    assert state is not None
+    assert state.attributes[ATTR_TARGET_TEMP_LOW] == 20.0
+    assert state.attributes[ATTR_TARGET_TEMP_HIGH] == 24.0
+
+
+async def test_enter_heat_cool_from_heat_moves_setpoint_to_low_bound(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity
+) -> None:
+    """Entering heat_cool from heat moves the setpoint down to the low bound."""
+    # A restored heat state whose setpoint sits above its stale bounds.
+    last_state = State(
+        "climate.thermostat_2",
+        HVACMode.HEAT,
+        {
+            ATTR_TEMPERATURE: 24.0,
+            ATTR_TARGET_TEMP_LOW: 21.0,
+            ATTR_TARGET_TEMP_HIGH: 23.0,
+        },
+    )
+    thermostat.current_temperature = 25.0
+    await create_wrapper(min_cycle=0, last_state=last_state)
+    entity = wrapper_entity()
+
+    await entity.async_set_hvac_mode(HVACMode.HEAT_COOL)
+    await hass.async_block_till_done()
+
+    # The 24.0 setpoint becomes the low bound; the high stretches to keep the gap.
+    state = hass.states.get(entity.entity_id)
+    assert state is not None
+    assert state.attributes[ATTR_TARGET_TEMP_LOW] == 24.0
+    assert state.attributes[ATTR_TARGET_TEMP_HIGH] == 26.0
+    # Hot room: past the new midpoint, so the source is driven to cool at 26.
+    assert thermostat.set_temperature_calls == [
+        {
+            ATTR_ENTITY_ID: SOURCE_ENTITY,
+            ATTR_TEMPERATURE: 26.0,
+            ATTR_HVAC_MODE: HVACMode.COOL,
+        }
+    ]
 
 
 async def test_leave_heat_cool_to_off(
