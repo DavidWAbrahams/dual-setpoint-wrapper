@@ -81,6 +81,9 @@ _FALLBACK_LIMITS = {
 
 UNAVAILABLE_STATES = (STATE_UNAVAILABLE, STATE_UNKNOWN)
 
+# Appended to the source's name so a wrapper is recognizable next to its base.
+_NAME_SUFFIX = " dual setpoint"
+
 # Core rounds displayed temperatures to the entity's precision, and its default
 # precision for Fahrenheit systems is whole degrees. A Celsius-native source
 # (e.g. an ESPHome CN105) still publishes half- or tenth-degree Fahrenheit
@@ -108,6 +111,15 @@ _MIRRORED_FEATURES = (
     ClimateEntityFeature.TURN_OFF,
     ClimateEntityFeature.SWING_HORIZONTAL_MODE,
 )
+
+
+def _suffixed_name(base: str | None) -> str | None:
+    """Mark a copied source name so the wrapper reads as one."""
+    if base is None:
+        return None
+    if base.casefold().endswith(_NAME_SUFFIX.strip()):
+        return base
+    return f"{base}{_NAME_SUFFIX}"
 
 
 def _as_float(value: Any) -> float | None:
@@ -209,12 +221,12 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             if device_id and (device := device_registry.async_get(device_id)):
                 self.device_entry = device
                 self._attr_has_entity_name = registry_entry.has_entity_name
-                self._attr_name = registry_entry.original_name
+                self._attr_name = _suffixed_name(registry_entry.original_name)
                 return
 
         if source_name is None and (state := hass.states.get(self._source_entity_id)):
             source_name = state.attributes.get(ATTR_FRIENDLY_NAME)
-        self._attr_name = source_name or "Dual setpoint"
+        self._attr_name = _suffixed_name(source_name) or "Dual setpoint"
 
     # ------------------------------------------------------------------
     # Mirrored surface

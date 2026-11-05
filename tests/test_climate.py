@@ -22,6 +22,7 @@ from homeassistant.components.climate import (
 )
 from homeassistant.const import (
     ATTR_ENTITY_ID,
+    ATTR_FRIENDLY_NAME,
     ATTR_SUPPORTED_FEATURES,
     PRECISION_HALVES,
     PRECISION_TENTHS,
@@ -103,6 +104,17 @@ async def test_mirrored_surface_tracks_source_attributes(
     state = hass.states.get(wrapper_id())
     assert state is not None
     assert state.attributes["current_temperature"] == 18.5
+
+
+async def test_wrapper_name_marks_the_source_name(
+    hass: HomeAssistant, create_wrapper, wrapper_id
+) -> None:
+    """The copied source name gets a dual-setpoint suffix on the wrapper."""
+    await create_wrapper()
+
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.attributes[ATTR_FRIENDLY_NAME] == "Thermostat dual setpoint"
 
 
 async def test_imperial_half_degree_source_reading_survives(
