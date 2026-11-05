@@ -1,7 +1,8 @@
 # Dual Setpoint Climate
 
 Expose native `heat_cool` (a heating setpoint *and* a cooling setpoint) on top
-of any Home Assistant climate entity that only supports a single setpoint.
+of any Home Assistant climate entity that has heating and cooling but only
+supports a single setpoint.
 
 Many thermostats and HVAC integrations expose just one target temperature with
 `heat`/`cool`/`off` modes. Home Assistant's thermostat cards, schedules, and
@@ -34,8 +35,7 @@ that drives it behind the scenes.
 ## Installation
 
 1. Install [HACS](https://hacs.xyz/).
-2. Add this repository as a custom repository (category: *Integration*) or use
-   the default repo listing once published.
+2. Add this repository as a custom repository (category: *Integration*)
 3. Install **Dual Setpoint Climate** and restart Home Assistant.
 4. Go to *Settings → Devices & Services → Add Integration → Dual Setpoint
    Climate* and pick the source climate entity to wrap.
@@ -58,34 +58,3 @@ overshoot carries the temperature past the midpoint, the wrapper will flip back
 and forth and the unit will fight itself. Set the bounds, and `min_gap`,
 comfortably farther apart than your equipment's overshoot so the temperature
 has room to settle before the other side becomes active.
-
-## Development
-
-This repository started as the
-[`integration_blueprint`](https://github.com/ludeeus/integration_blueprint)
-template.
-
-- `custom_components/dual_setpoint/` — the integration itself.
-- `tests/` — pytest suite (`pytest-homeassistant-custom-component`); run with
-  `python -m pytest tests/ -q`.
-- `scripts/develop` — start Home Assistant with this integration loaded
-  (the dev config enables `demo:` so there are climate entities to wrap).
-- Linting uses [ruff](https://docs.astral.sh/ruff/): `python -m ruff check .`
-  and `python -m ruff format .`.
-- `scripts/generate_brand_images.py` regenerates the brand images
-  (dial with two setpoints) written to
-  `custom_components/dual_setpoint/brand/`.
-
-### Brand images
-
-Since Home Assistant 2026.3 an integration can ship its own icon and logo in
-`custom_components/dual_setpoint/brand/`; Home Assistant serves them
-automatically and they take priority over the
-[brands](https://github.com/home-assistant/brands) repository, so no extra
-configuration is needed. The images here are generated with
-`python scripts/generate_brand_images.py` (requires Pillow, already a Home
-Assistant dependency).
-
-`ignore: brands` stays in `.github/workflows/validate.yml` only because the
-pinned HACS validation action predates local brand images; a companion PR to
-the brands repository remains optional.
