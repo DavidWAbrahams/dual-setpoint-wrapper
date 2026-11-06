@@ -669,7 +669,15 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         flip_needed = state.state != desired_mode
 
         if flip_needed and gate_flips and not self._flip_allowed(dt_util.utcnow()):
-            return
+            # The flip itself waits for the cycle time, but the side the
+            # source is actually running on should still track its bound:
+            # a bound edited right now would otherwise never reach the
+            # device until the flip finally happens.
+            hold = self._hold_on_current_side(state.state)
+            if hold is None:
+                return
+            desired_mode, desired_temp = hold
+            flip_needed = False
 
         self._applying = True
         try:
@@ -679,6 +687,20 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         finally:
             self._applying = False
         self.async_write_ha_state()
+
+    def _hold_on_current_side(self, source_mode: str) -> tuple[HVACMode, float] | None:
+        """
+        Return what to command while a flip is deferred.
+
+        The source keeps running on its current side, so re-assert that
+        side's (possibly just edited) bound. An idle source has no active
+        side to keep current.
+        """
+        if source_mode == HVACMode.HEAT and self._target_temp_low is not None:
+            return HVACMode.HEAT, self._target_temp_low
+        if source_mode == HVACMode.COOL and self._target_temp_high is not None:
+            return HVACMode.COOL, self._target_temp_high
+        return None
 
     def _flip_allowed(self, now: datetime) -> bool:
         """Return True when a heat<->cool flip may happen now."""

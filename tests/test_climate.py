@@ -344,6 +344,56 @@ async def test_flip_blocked_by_cycle_time_then_fires(
     assert entity._defer_unsub is None
 
 
+async def test_blocked_flip_still_syncs_active_bound(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity
+) -> None:
+    """While a flip waits out the cycle time, the running side stays current."""
+    # Warm room, so entering heat_cool flips the heat source to cool right away.
+    thermostat.current_temperature = 25.0
+    await create_wrapper(min_cycle=900)
+    entity = wrapper_entity()
+    await entity.async_set_hvac_mode(HVACMode.HEAT_COOL)
+    await hass.async_block_till_done()
+    assert hass.states.get(SOURCE_ENTITY).state == HVACMode.COOL
+
+    thermostat.set_temperature_calls.clear()
+
+    # Raise the upper bound so far that the midpoint passes the current
+    # temperature: the wrapper now wants to heat, but the flip is blocked by
+    # the cycle time and the source stays cooling.
+    await entity.async_set_temperature(
+        **{ATTR_TARGET_TEMP_LOW: 20.0, ATTR_TARGET_TEMP_HIGH: 32.0}
+    )
+    await hass.async_block_till_done()
+
+    # The source must not flip early...
+    assert hass.states.get(SOURCE_ENTITY).state == HVACMode.COOL
+    assert entity._defer_unsub is not None
+    # ...but it still cools against the new upper bound, not the stale one.
+    assert thermostat.set_temperature_calls == [
+        {
+            ATTR_ENTITY_ID: SOURCE_ENTITY,
+            ATTR_TEMPERATURE: 32.0,
+            ATTR_HVAC_MODE: HVACMode.COOL,
+        }
+    ]
+
+    past_flip = dt_util.utcnow() - timedelta(minutes=15)
+    entity._last_flip = past_flip
+
+    # When the cycle time elapses, the deferred flip completes as intended.
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=901))
+    await hass.async_block_till_done()
+
+    assert thermostat.set_temperature_calls[-1] == {
+        ATTR_ENTITY_ID: SOURCE_ENTITY,
+        ATTR_TEMPERATURE: 20.0,
+        ATTR_HVAC_MODE: HVACMode.HEAT,
+    }
+    assert hass.states.get(SOURCE_ENTITY).state == HVACMode.HEAT
+    assert entity._defer_unsub is None
+
+
 async def test_single_setpoint_edit_in_heat(
     hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity
 ) -> None:
