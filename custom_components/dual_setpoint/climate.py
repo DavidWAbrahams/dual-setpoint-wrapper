@@ -194,9 +194,12 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         self._target_temp_high: float | None = None
         self._last_flip: datetime | None = None
 
-        # Command tracking, used to tell our own writes from external changes
+        # Command tracking, used to tell our own writes from external changes.
+        # A range command (sent to a native dual-setpoint source) tracks its
+        # pair in _expected_bounds instead of a single _expected_temp.
         self._expected_mode: HVACMode | None = None
         self._expected_temp: float | None = None
+        self._expected_bounds: tuple[float, float] | None = None
         self._pending = False
 
         self._settle_unsub: CALLBACK_TYPE | None = None
@@ -537,6 +540,40 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         attrs = self._source_attributes
         return _as_float(attrs.get(ATTR_TEMPERATURE))
 
+    def _source_range(self) -> tuple[float, float] | None:
+        """Return the source's dual setpoints when it publishes both."""
+        attrs = self._source_attributes
+        low = _as_float(attrs.get(ATTR_TARGET_TEMP_LOW))
+        high = _as_float(attrs.get(ATTR_TARGET_TEMP_HIGH))
+        if low is None or high is None:
+            return None
+        return low, high
+
+    @property
+    def _source_native_range(self) -> bool:
+        """
+        Return True when the source runs heat_cool with dual setpoints.
+
+        A source offering heat_cool without the range feature is really an
+        "auto" mode that holds one setpoint within a band (an ESPHome CN105,
+        for example). Such a mode is incompatible with the wrapper owning the
+        pair, so we never delegate heat_cool to it. A source with the range
+        feature, on the other hand, can hold our low and high setpoints
+        natively, and delegating to it is strictly better than our own
+        midpoint engine.
+        """
+        state = self._source_state
+        if state is None:
+            return False
+        if HVACMode.HEAT_COOL not in (state.attributes.get(ATTR_HVAC_MODES) or []):
+            return False
+        raw = state.attributes.get(ATTR_SUPPORTED_FEATURES) or 0
+        try:
+            features = ClimateEntityFeature(int(raw))
+        except ValueError:
+            return False
+        return ClimateEntityFeature.TARGET_TEMPERATURE_RANGE in features
+
     # ------------------------------------------------------------------
     # Command layer
     # ------------------------------------------------------------------
@@ -566,6 +603,7 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             self._expected_temp = (
                 temperature if temperature is not None else source_temp
             )
+            self._expected_bounds = None
             return True
 
         data: dict[str, Any] = {ATTR_ENTITY_ID: self._source_entity_id}
@@ -601,9 +639,84 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
 
         self._expected_mode = mode
         self._expected_temp = temperature
+        self._expected_bounds = None
         self._pending = True
         self._arm_settle_timer()
+        self._settle_if_already_matching()
         return False
+
+    async def _async_command_range(self, low: float, high: float) -> bool:
+        """
+        Push the dual setpoints to a source that runs heat_cool natively.
+
+        Returns True when the source already matched and nothing was sent.
+        """
+        if not self._available_for_command():
+            return False
+
+        state = self._source_state
+        assert state is not None  # noqa: S101
+        tolerance = self._step_tolerance() + GAP_EPSILON
+
+        source_range = self._source_range()
+        mode_matches = state.state == HVACMode.HEAT_COOL
+        temp_matches = (
+            source_range is not None
+            and abs(source_range[0] - low) <= tolerance
+            and abs(source_range[1] - high) <= tolerance
+        )
+        if mode_matches and temp_matches:
+            self._clear_pending()
+            self._expected_mode = HVACMode.HEAT_COOL
+            self._expected_temp = None
+            self._expected_bounds = source_range
+            return True
+
+        try:
+            await self.hass.services.async_call(
+                "climate",
+                "set_temperature",
+                {
+                    ATTR_ENTITY_ID: self._source_entity_id,
+                    ATTR_HVAC_MODE: HVACMode.HEAT_COOL,
+                    ATTR_TARGET_TEMP_LOW: low,
+                    ATTR_TARGET_TEMP_HIGH: high,
+                },
+                blocking=True,
+                context=self._context,
+            )
+        except ServiceValidationError:
+            raise
+        except HomeAssistantError as err:
+            LOGGER.warning(
+                "Could not command %s to heat_cool %s-%s: %s",
+                self._source_entity_id,
+                low,
+                high,
+                err,
+            )
+            return False
+
+        self._expected_mode = HVACMode.HEAT_COOL
+        self._expected_temp = None
+        self._expected_bounds = (low, high)
+        self._pending = True
+        self._arm_settle_timer()
+        self._settle_if_already_matching()
+        return False
+
+    def _settle_if_already_matching(self) -> None:
+        """
+        Close out a command the source confirmed inside the service call.
+
+        Devices that update synchronously echo their new state while we are
+        still applying, and that change event goes unheard behind the
+        _applying guard. Without this, the echo would leave us pending until
+        the settle window expired, swallowing any real change made in the
+        meantime as if it were a stale echo.
+        """
+        if self._source_matches_expected():
+            self._clear_pending()
 
     def _available_for_command(self) -> bool:
         """Return True when commands may be sent to the source."""
@@ -647,6 +760,36 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         if self._target_temp_low is None or self._target_temp_high is None:
             return
 
+        if self._source_native_range:
+            # The source can hold both setpoints itself; our midpoint engine
+            # would only fight it for control. Delegate instead, and let the
+            # mirrored bounds ride straight through to the device.
+            assert self._target_temp_low is not None  # noqa: S101
+            assert self._target_temp_high is not None  # noqa: S101
+            self._applying = True
+            try:
+                await self._async_command_range(
+                    self._target_temp_low, self._target_temp_high
+                )
+            finally:
+                self._applying = False
+            self.async_write_ha_state()
+            return
+
+        await self._async_apply_single_side(gate_flips=gate_flips)
+
+    async def _async_apply_single_side(self, *, gate_flips: bool) -> None:
+        """
+        Run the midpoint engine against a source without dual setpoints.
+
+        The source holds one setpoint at a time, so the pair we own can only
+        be approximated by running it on one side: heating toward the low
+        bound or cooling toward the high, switching sides around the midpoint
+        of the range.
+        """
+        assert self._target_temp_low is not None  # noqa: S101
+        assert self._target_temp_high is not None  # noqa: S101
+
         reading = self.current_temperature
         if reading is None:
             if not self._warned_no_reading:
@@ -666,9 +809,31 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
 
         state = self._source_state
         assert state is not None  # noqa: S101
+
+        # A source that runs heat_cool without dual setpoints is really an
+        # "auto" mode balancing around one setpoint (an ESPHome CN105, for
+        # example). It cannot hold the pair we own, so it must not persist
+        # while we are in heat_cool: kick it back to whichever single mode
+        # matches the room. Leaving auto is not a compressor flip in the
+        # usual sense, so the cycle time never delays this recovery; the
+        # flip clock is still stamped below to protect the next flip.
+        auto_recovery = state.state == HVACMode.HEAT_COOL
+        if auto_recovery:
+            LOGGER.debug(
+                "Source %s sits in its own single-setpoint heat_cool; "
+                "forcing it back to %s",
+                self._source_entity_id,
+                desired_mode,
+            )
+
         flip_needed = state.state != desired_mode
 
-        if flip_needed and gate_flips and not self._flip_allowed(dt_util.utcnow()):
+        if (
+            flip_needed
+            and gate_flips
+            and not auto_recovery
+            and not self._flip_allowed(dt_util.utcnow())
+        ):
             # The flip itself waits for the cycle time, but the side the
             # source is actually running on should still track its bound:
             # a bound edited right now would otherwise never reach the
@@ -772,6 +937,15 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         assert state is not None  # noqa: S101
         if self._expected_mode is not None and state.state != self._expected_mode:
             return False
+        if self._expected_bounds is not None:
+            source_range = self._source_range()
+            if source_range is None:
+                return False  # the pair has not echoed back yet
+            tolerance = self._step_tolerance() + GAP_EPSILON
+            return (
+                abs(source_range[0] - self._expected_bounds[0]) <= tolerance
+                and abs(source_range[1] - self._expected_bounds[1]) <= tolerance
+            )
         source_temp = self._source_target()
         if self._expected_temp is None or source_temp is None:
             return True
@@ -786,6 +960,23 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         assert state is not None  # noqa: S101
         if self._expected_mode is not None and state.state != self._expected_mode:
             return True
+        # With a native dual-setpoint source both bounds are live on the
+        # device, so an edit to either one is news. Our own mirrored bounds
+        # are the reference: outside the settle window they are exactly what
+        # the source last reported.
+        if self._attr_hvac_mode == HVACMode.HEAT_COOL and self._source_native_range:
+            source_range = self._source_range()
+            if (
+                source_range is None
+                or self._target_temp_low is None
+                or self._target_temp_high is None
+            ):
+                return False
+            tolerance = self._step_tolerance() + GAP_EPSILON
+            return (
+                abs(source_range[0] - self._target_temp_low) > tolerance
+                or abs(source_range[1] - self._target_temp_high) > tolerance
+            )
         source_temp = self._source_target()
         if self._expected_temp is None or source_temp is None:
             return False
@@ -795,23 +986,39 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         )
 
     def _mirror_source_state(self, *, initial: bool = False) -> None:
-        """Adopt the source's mode and setpoint as our own."""
+        """Adopt the source's mode and setpoints as our own."""
         state = self._source_state
         if state is None or state.state in UNAVAILABLE_STATES:
             return
 
         with contextlib.suppress(ValueError):
             self._attr_hvac_mode = HVACMode(state.state)
-        source_temp = self._source_target()
-        self._target_temp = source_temp
-        self._expected_mode = self._attr_hvac_mode
-        self._expected_temp = source_temp
-        self._pending = False
 
-        if source_temp is not None:
-            self._apply_bound(source_temp)
-        elif self._target_temp_low is None or self._target_temp_high is None:
-            self._seed_bounds(None)
+        # A native dual-setpoint source in heat_cool owns the pair directly;
+        # mirror both bounds instead of forcing them through the single
+        # setpoint path, which would drop the side this mode does not own.
+        source_range = (
+            self._source_range()
+            if self._attr_hvac_mode == HVACMode.HEAT_COOL and self._source_native_range
+            else None
+        )
+        if source_range is not None:
+            self._target_temp = None
+            self._target_temp_low, self._target_temp_high = source_range
+            self._expected_mode = HVACMode.HEAT_COOL
+            self._expected_temp = None
+            self._expected_bounds = source_range
+        else:
+            source_temp = self._source_target()
+            self._target_temp = source_temp
+            self._expected_mode = self._attr_hvac_mode
+            self._expected_temp = source_temp
+            self._expected_bounds = None
+            if source_temp is not None:
+                self._apply_bound(source_temp)
+            elif self._target_temp_low is None or self._target_temp_high is None:
+                self._seed_bounds(None)
+        self._pending = False
 
         if initial:
             self._clear_pending()

@@ -17,8 +17,11 @@ from homeassistant.components.climate import (
     ATTR_HVAC_MODES,
     ATTR_MAX_TEMP,
     ATTR_MIN_TEMP,
+    ATTR_TARGET_TEMP_HIGH,
+    ATTR_TARGET_TEMP_LOW,
     ATTR_TARGET_TEMP_STEP,
     ATTR_TEMPERATURE,
+    ClimateEntityFeature,
     HVACMode,
 )
 from homeassistant.config_entries import ConfigEntryState
@@ -64,7 +67,21 @@ def auto_enable_custom_integrations(enable_custom_integrations: None) -> None:
 
 
 class FakeThermostat:
-    """A single-setpoint climate entity simulated with plain state."""
+    """
+    A climate entity simulated with plain state.
+
+    By default it is a single-setpoint heat/cool/off source. The two
+    heat_cool flavors the wrapper must handle are selectable:
+
+    ``expose_heat_cool``
+        Adds heat_cool to the mode list without dual setpoints: the
+        CN105-style "auto" that balances around one setpoint.
+
+    ``native_range``
+        Adds heat_cool together with the TARGET_TEMPERATURE_RANGE feature
+        and live target_temp_low/target_temp_high attributes: a source the
+        wrapper can delegate the pair to.
+    """
 
     def __init__(self, hass: HomeAssistant) -> None:
         """Register the climate.set_temperature service we answer to."""
@@ -77,6 +94,10 @@ class FakeThermostat:
         self.step: float = 1.0
         self.online: bool = True
         self.echo: bool = True
+        self.expose_heat_cool: bool = False
+        self.native_range: bool = False
+        self.low_temp: float = 18.0
+        self.high_temp: float = 24.0
         self.set_temperature_calls: list[dict[str, Any]] = []
         self.set_hvac_mode_calls: list[dict[str, Any]] = []
         self.register_service()
@@ -93,16 +114,26 @@ class FakeThermostat:
     @property
     def attributes(self) -> dict[str, Any]:
         """Return the attributes the source reports."""
-        return {
+        modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL]
+        if self.expose_heat_cool or self.native_range:
+            modes.append(HVACMode.HEAT_COOL)
+        features = 0
+        if self.native_range:
+            features = ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+        attrs: dict[str, Any] = {
             ATTR_FRIENDLY_NAME: "Thermostat",
-            ATTR_HVAC_MODES: [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL],
+            ATTR_HVAC_MODES: modes,
             ATTR_MIN_TEMP: self.min_temp,
             ATTR_MAX_TEMP: self.max_temp,
             ATTR_TARGET_TEMP_STEP: self.step,
             ATTR_CURRENT_TEMPERATURE: self.current_temperature,
             ATTR_TEMPERATURE: self.temperature,
-            ATTR_SUPPORTED_FEATURES: 0,
+            ATTR_SUPPORTED_FEATURES: features,
         }
+        if self.native_range:
+            attrs[ATTR_TARGET_TEMP_LOW] = self.low_temp
+            attrs[ATTR_TARGET_TEMP_HIGH] = self.high_temp
+        return attrs
 
     def seed(self) -> None:
         """Create the source entity for the first time."""
@@ -125,6 +156,8 @@ class FakeThermostat:
         mode: HVACMode | None = None,
         temperature: float | None = None,
         current: float | None = None,
+        low: float | None = None,
+        high: float | None = None,
     ) -> None:
         """Change the source the way a remote, app, or UI would."""
         if mode is not None:
@@ -133,6 +166,10 @@ class FakeThermostat:
             self.temperature = temperature
         if current is not None:
             self.current_temperature = current
+        if low is not None:
+            self.low_temp = low
+        if high is not None:
+            self.high_temp = high
         self._push()
 
     async def _async_handle_set_temperature(self, call: ServiceCall) -> None:
@@ -153,6 +190,10 @@ class FakeThermostat:
             self.mode = HVACMode(mode)
         if (temperature := call.data.get(ATTR_TEMPERATURE)) is not None:
             self.temperature = float(temperature)
+        if (low := call.data.get(ATTR_TARGET_TEMP_LOW)) is not None:
+            self.low_temp = float(low)
+        if (high := call.data.get(ATTR_TARGET_TEMP_HIGH)) is not None:
+            self.high_temp = float(high)
         if self.echo:
             self._push()
 
