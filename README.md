@@ -47,3 +47,17 @@ that drives it behind the scenes.
 | **Minimum cycle time** | How long to wait before flipping the source between heating and cooling. Defaults to 30 minutes.                                                                   |
 
 Options can be changed later from the integration's entry (⋮ → _Configure_).
+
+## FAQ
+
+Q: Is this dangerous?
+A: All the safety features of the base Climate entity and the actual hardware are still in place. This integration isn’t doing anything that you couldn’t do yourself manually with the remote control.
+
+Q: Does this waste energy by flopping between heating and cooling?
+A: There are two configurable settings to prevent this. First, there is an enforced minimum gap between the upper and lower setpoints (2 °C or 4 °F default). Second, there is a minimum cycle time (30 minutes default).
+
+Q: Does this bypass the energy saving features of my heat pump?
+A: No. The mode is changed well before the room temperature crosses a setpoint, giving your heat pump time to do whatever condenser tricks it supports.
+
+Q: What if I make changes using the physical remote, or the underlying Climate entity?
+A: The wrapper will mirror whatever the underlying Climate entity does. The ONLY case where the wrapper will fight you is if you switch the underlying entity to “Heat/Cool” mode that has only 1 setpoint. In that case, the wrapper will supercede it with its dual-setpoint behavior, kicking it back into heat mode or cool mode as appropriate.
