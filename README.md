@@ -1,8 +1,7 @@
 # Dual Setpoint Climate
 
 Expose native `heat_cool` (a heating setpoint _and_ a cooling setpoint) on top
-of any Home Assistant climate entity that has heating and cooling but only
-supports a single setpoint.
+of any Home Assistant climate entity that has heating and cooling modes.
 
 Many thermostats and HVAC integrations expose just one target temperature with
 `heat`/`cool`/`off` modes. Home Assistant's thermostat cards, schedules, and
