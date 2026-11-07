@@ -7,8 +7,8 @@ Many thermostats and HVAC integrations expose just one target temperature with
 `heat`/`cool`/`off` modes. Home Assistant's thermostat cards, schedules, and
 automations are much nicer when the entity supports `heat_cool` with
 `target_temp_low`/`target_temp_high`. This integration is a _helper_: it wraps
-one such "source" entity and presents a complete dual-setpoint climate entity
-that drives it behind the scenes.
+a "source" entity and presents a complete dual-setpoint climate entity
+on top of it.
 
 ## How it works
 
