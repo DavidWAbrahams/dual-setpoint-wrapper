@@ -30,7 +30,7 @@ CONF_MIN_CYCLE_TIME = "min_cycle_time"
 # instead of an awkward 3.6 °F.
 DEFAULT_MIN_GAP_CELSIUS = 2.0
 DEFAULT_MIN_GAP_FAHRENHEIT = 4.0
-DEFAULT_MIN_CYCLE_TIME = timedelta(minutes=15)
+DEFAULT_MIN_CYCLE_TIME = timedelta(minutes=30)
 
 # How long to wait for the source entity to report the mode and setpoint we
 # just commanded before deciding that whatever it reports is the truth.
