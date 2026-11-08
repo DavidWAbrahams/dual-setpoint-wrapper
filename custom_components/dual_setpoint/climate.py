@@ -751,14 +751,27 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
     # ------------------------------------------------------------------
     # heat_cool engine
     # ------------------------------------------------------------------
-    async def _async_evaluate(self, *, gate_flips: bool = True) -> None:
-        """Bring the source in line with the bounds while in heat_cool."""
+    async def _async_evaluate(
+        self, *, gate_flips: bool = True, user_initiated: bool = False
+    ) -> None:
+        """
+        Bring the source in line with the bounds while in heat_cool.
+
+        A user-initiated evaluation flips through the cycle-time gate: an
+        edit that moves the midpoint across the room is the user choosing
+        the other side on purpose, not the room wandering across it on its
+        own, so it takes effect now even when the last flip was recent.
+        """
         if self._applying or self._attr_hvac_mode != HVACMode.HEAT_COOL:
             return
         if not self._available_for_command():
             return
         if self._target_temp_low is None or self._target_temp_high is None:
             return
+        if user_initiated:
+            # This immediate evaluation supersedes any flip deferred by an
+            # earlier gated pass.
+            self._cancel_pending_flip()
 
         if self._source_native_range:
             # The source can hold both setpoints itself; our midpoint engine
@@ -776,7 +789,9 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             self.async_write_ha_state()
             return
 
-        await self._async_apply_single_side(gate_flips=gate_flips)
+        await self._async_apply_single_side(
+            gate_flips=gate_flips and not user_initiated
+        )
 
     async def _async_apply_single_side(self, *, gate_flips: bool) -> None:
         """
@@ -1148,7 +1163,10 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             self._target_temp = self._target_temp_high
             await self._async_command(HVACMode.COOL, self._target_temp_high)
         elif self._attr_hvac_mode == HVACMode.HEAT_COOL:
-            await self._async_evaluate(gate_flips=True)
+            # User input that moves the midpoint across the room selects the
+            # other side deliberately; flip now even if the cycle time has
+            # not elapsed.
+            await self._async_evaluate(gate_flips=True, user_initiated=True)
         self.async_write_ha_state()
 
     async def _async_set_single(self, temperature: float) -> None:

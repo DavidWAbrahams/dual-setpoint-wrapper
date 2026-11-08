@@ -344,11 +344,12 @@ async def test_flip_blocked_by_cycle_time_then_fires(
     assert entity._defer_unsub is None
 
 
-async def test_blocked_flip_still_syncs_active_bound(
+async def test_user_range_edit_flips_through_cycle_time(
     hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity
 ) -> None:
-    """While a flip waits out the cycle time, the running side stays current."""
-    # Warm room, so entering heat_cool flips the heat source to cool right away.
+    """A setpoint edit that moves the midpoint across the room flips at once."""
+    # Warm room, so entering heat_cool flips the heat source to cool right away
+    # and stamps the flip clock.
     thermostat.current_temperature = 25.0
     await create_wrapper(min_cycle=900)
     entity = wrapper_entity()
@@ -359,24 +360,47 @@ async def test_blocked_flip_still_syncs_active_bound(
     thermostat.set_temperature_calls.clear()
 
     # Raise the upper bound so far that the midpoint passes the current
-    # temperature: the wrapper now wants to heat, but the flip is blocked by
-    # the cycle time and the source stays cooling.
+    # temperature: the user deliberately moved the room onto the heating
+    # side, so the flip happens even though the cycle time has not elapsed.
     await entity.async_set_temperature(
         **{ATTR_TARGET_TEMP_LOW: 20.0, ATTR_TARGET_TEMP_HIGH: 32.0}
     )
     await hass.async_block_till_done()
 
-    # The source must not flip early...
-    assert hass.states.get(SOURCE_ENTITY).state == HVACMode.COOL
-    assert entity._defer_unsub is not None
-    # ...but it still cools against the new upper bound, not the stale one.
+    assert hass.states.get(SOURCE_ENTITY).state == HVACMode.HEAT
     assert thermostat.set_temperature_calls == [
         {
             ATTR_ENTITY_ID: SOURCE_ENTITY,
-            ATTR_TEMPERATURE: 32.0,
-            ATTR_HVAC_MODE: HVACMode.COOL,
+            ATTR_TEMPERATURE: 20.0,
+            ATTR_HVAC_MODE: HVACMode.HEAT,
         }
     ]
+    # Nothing was deferred: the flip already happened.
+    assert entity._defer_unsub is None
+    # The flip clock was re-stamped, so the next flip waits again.
+    assert entity._last_flip is not None
+
+
+async def test_room_crossing_still_waits_out_cycle_time(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity
+) -> None:
+    """A midpoint crossing caused by the room, not the user, stays gated."""
+    thermostat.current_temperature = 25.0
+    await create_wrapper(min_cycle=900)
+    entity = wrapper_entity()
+    await entity.async_set_hvac_mode(HVACMode.HEAT_COOL)
+    await hass.async_block_till_done()
+    assert hass.states.get(SOURCE_ENTITY).state == HVACMode.COOL
+
+    thermostat.set_temperature_calls.clear()
+
+    # The room cools below the midpoint on its own: the flip is blocked by
+    # the cycle time and a retry is armed instead.
+    thermostat.external_set(current=15.0)
+    await hass.async_block_till_done()
+    assert hass.states.get(SOURCE_ENTITY).state == HVACMode.COOL
+    assert thermostat.set_temperature_calls == []
+    assert entity._defer_unsub is not None
 
     past_flip = dt_util.utcnow() - timedelta(minutes=15)
     entity._last_flip = past_flip
@@ -387,7 +411,7 @@ async def test_blocked_flip_still_syncs_active_bound(
 
     assert thermostat.set_temperature_calls[-1] == {
         ATTR_ENTITY_ID: SOURCE_ENTITY,
-        ATTR_TEMPERATURE: 20.0,
+        ATTR_TEMPERATURE: 21.0,
         ATTR_HVAC_MODE: HVACMode.HEAT,
     }
     assert hass.states.get(SOURCE_ENTITY).state == HVACMode.HEAT
