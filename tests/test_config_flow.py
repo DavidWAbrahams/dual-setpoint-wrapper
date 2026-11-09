@@ -50,7 +50,7 @@ async def test_create_entry(hass: HomeAssistant, thermostat) -> None:
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "Thermostat"
     assert result["data"] == {CONF_SOURCE_ENTITY: SOURCE_ENTITY}
-    assert result["options"] == {CONF_MIN_GAP: 2.0, CONF_MIN_CYCLE_TIME: 900}
+    assert result["options"] == {CONF_MIN_GAP: 2.0, CONF_MIN_CYCLE_TIME: 1800}
 
     # Finishing the flow adds (and auto-sets-up) the entry under "result".
     entry = result["result"]

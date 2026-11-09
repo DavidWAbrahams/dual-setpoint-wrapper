@@ -604,6 +604,7 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
                 temperature if temperature is not None else source_temp
             )
             self._expected_bounds = None
+            self._adopt_echoed_setpoint()
             return True
 
         data: dict[str, Any] = {ATTR_ENTITY_ID: self._source_entity_id}
@@ -670,6 +671,7 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             self._expected_mode = HVACMode.HEAT_COOL
             self._expected_temp = None
             self._expected_bounds = source_range
+            self._adopt_echoed_setpoint()
             return True
 
         try:
@@ -717,6 +719,7 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         """
         if self._source_matches_expected():
             self._clear_pending()
+            self._adopt_echoed_setpoint()
 
     def _available_for_command(self) -> bool:
         """Return True when commands may be sent to the source."""
@@ -729,6 +732,38 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         if self._settle_unsub is not None:
             self._settle_unsub()
             self._settle_unsub = None
+
+    def _adopt_echoed_setpoint(self) -> None:
+        """
+        Restamp our setpoints with what the source says it actually holds.
+
+        A device may quantize a setpoint we sent to its own grid (a
+        Celsius-native heat pump handed a Fahrenheit target) and echo back a
+        hair off it. That echo confirms the command, but the device then runs
+        on its rounded value: had we kept showing the value we sent, the two
+        UIs would display different setpoints indefinitely. The device's
+        reading is the truth, so adopt it into the bound the command owned.
+        """
+        if self._expected_bounds is not None:
+            source_range = self._source_range()
+            if source_range is not None:
+                self._target_temp_low, self._target_temp_high = source_range
+                self._expected_bounds = source_range
+            return
+        source_temp = self._source_target()
+        if source_temp is None:
+            return
+        self._expected_temp = source_temp
+        if self._attr_hvac_mode == HVACMode.HEAT_COOL:
+            # The wrapper owns the pair while the source holds one side of
+            # it; restamp the bound of the side the command addressed.
+            if self._expected_mode == HVACMode.COOL:
+                self._target_temp_high = source_temp
+            elif self._expected_mode == HVACMode.HEAT:
+                self._target_temp_low = source_temp
+        else:
+            self._target_temp = source_temp
+            self._apply_bound(source_temp)
 
     def _arm_settle_timer(self) -> None:
         """Start the window in which the source may confirm our command."""
@@ -927,6 +962,7 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
                 self.async_write_ha_state()
                 return
             self._clear_pending()
+            self._adopt_echoed_setpoint()
         elif self._is_out_of_band():
             LOGGER.debug(
                 "Source %s changed outside of our control, mirroring %s",

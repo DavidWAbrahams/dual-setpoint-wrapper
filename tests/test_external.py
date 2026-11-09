@@ -112,10 +112,10 @@ async def test_one_step_source_change_is_out_of_band(
     assert thermostat.set_temperature_calls == []
 
 
-async def test_grid_rounded_echo_confirms_command(
+async def test_grid_rounded_echo_adopts_source_value(
     hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity, wrapper_id
 ) -> None:
-    """An echo landed within half a step of what we sent confirms it."""
+    """An echo within half a step confirms the command and is adopted."""
     await create_wrapper()
     entity = wrapper_entity()
 
@@ -124,17 +124,62 @@ async def test_grid_rounded_echo_confirms_command(
     await hass.async_block_till_done()
     assert entity._pending is True
 
-    # A device quantizing setpoints to its own (e.g. Celsius) grid echoes a
-    # hair below what we sent; that still reads as our command returning,
-    # and the wrapper keeps showing the value the user picked.
-    thermostat.external_set(temperature=22.55)
+    # A device quantizing setpoints to its own grid echoes back a half step
+    # off what we sent. That reads as our command returning, and the device's
+    # reading is the truth it will run on, so the wrapper adopts it instead of
+    # going on showing the value it asked for.
+    thermostat.external_set(temperature=22.5)
     await hass.async_block_till_done()
 
     assert entity._pending is False
     state = hass.states.get(wrapper_id())
     assert state is not None
-    assert state.attributes[ATTR_TEMPERATURE] == 23.0
+    assert state.attributes[ATTR_TEMPERATURE] == 22.5
+    assert state.attributes[ATTR_TARGET_TEMP_LOW] == 22.5
     assert len(thermostat.set_temperature_calls) == 1
+
+
+async def test_heat_cool_adopts_off_grid_echo(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity, wrapper_id
+) -> None:
+    """In heat_cool, a rounded echo restamps the bound of the commanded side."""
+    thermostat.current_temperature = 15.0
+    await create_wrapper()
+    entity = wrapper_entity()
+    await entity.async_set_hvac_mode(HVACMode.HEAT_COOL)
+    await hass.async_block_till_done()
+
+    # Lower the heating setpoint; the wrapper commands heat at 20.
+    thermostat.echo = False
+    await entity.async_set_temperature(
+        **{ATTR_TARGET_TEMP_LOW: 20.0, ATTR_TARGET_TEMP_HIGH: 23.0}
+    )
+    await hass.async_block_till_done()
+    assert entity._pending is True
+    assert thermostat.set_temperature_calls[-1] == {
+        ATTR_ENTITY_ID: SOURCE_ENTITY,
+        ATTR_TEMPERATURE: 20.0,
+        ATTR_HVAC_MODE: HVACMode.HEAT,
+    }
+
+    # The device quantizes to 20.5 on its own grid. The wrapper must land on
+    # 20.5 too, or its UI and the base entity's UI disagree about the target.
+    thermostat.external_set(temperature=20.5)
+    await hass.async_block_till_done()
+
+    assert entity._pending is False
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.attributes[ATTR_TARGET_TEMP_LOW] == 20.5
+    assert state.attributes[ATTR_TARGET_TEMP_HIGH] == 23.0
+
+    # Agreement holds: the source sits exactly on the adopted bound, so
+    # re-evaluating the pair commands nothing further.
+    assert hass.states.get(SOURCE_ENTITY).state == HVACMode.HEAT
+    thermostat.set_temperature_calls.clear()
+    await entity._async_evaluate(gate_flips=True)
+    await hass.async_block_till_done()
+    assert thermostat.set_temperature_calls == []
 
 
 async def test_unconfirmed_command_mirrors_source_after_settle_window(
