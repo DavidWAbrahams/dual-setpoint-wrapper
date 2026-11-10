@@ -12,11 +12,23 @@
                 "title": "Dual setpoint options",
                 "data": {
                     "min_gap": "Minimum gap between the low and high setpoints",
-                    "min_cycle_time": "Minimum time between heat and cool changes"
+                    "min_cycle_time": "Minimum time between heat and cool changes",
+                    "coordinate_modes": "Coordinate modes with other zones",
+                    "coordination_group": "Coordination group",
+                    "coordination_priority": "Priority",
+                    "thwarted_heat_hold": "Hold when heating is blocked",
+                    "thwarted_cool_hold": "Hold when cooling is blocked",
+                    "thwarted_fan_mode": "Fan speed while held"
                 },
                 "data_description": {
                     "min_gap": "Keep this comfortably larger than your thermostat's overshoot, or the unit will heat and cool against itself.",
-                    "min_cycle_time": "How long the wrapper waits before flipping between heating and cooling."
+                    "min_cycle_time": "How long the wrapper waits before flipping between heating and cooling.",
+                    "coordinate_modes": "For indoor units sharing one outdoor unit: the group conditions one direction at a time, and units on the losing side are held off (or fan only) until their turn. Their cards keep showing your mode and report idle.",
+                    "coordination_group": "Wrappers that share the same group name run on one outdoor unit and take turns.",
+                    "coordination_priority": "Breaks ties when zones claim the outdoor unit at the same time; higher wins. 0 suits most homes.",
+                    "thwarted_heat_hold": "What this unit is parked to while the group is cooling instead of heating: off, or fan only.",
+                    "thwarted_cool_hold": "What this unit is parked to while the group is heating instead of cooling: off, or fan only.",
+                    "thwarted_fan_mode": "Optional fan speed (named as your source names them) applied while parked in fan only. Leave empty to keep the unit's own fan speed."
                 }
             }
         },

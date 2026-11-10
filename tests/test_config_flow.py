@@ -17,9 +17,15 @@ from homeassistant.util.unit_system import METRIC_SYSTEM, US_CUSTOMARY_SYSTEM
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.dual_setpoint.const import (
+    CONF_COORDINATE_MODES,
+    CONF_COORDINATION_GROUP,
+    CONF_COORDINATION_PRIORITY,
     CONF_MIN_CYCLE_TIME,
     CONF_MIN_GAP,
     CONF_SOURCE_ENTITY,
+    CONF_THWARTED_COOL_HOLD,
+    CONF_THWARTED_FAN_MODE,
+    CONF_THWARTED_HEAT_HOLD,
     DOMAIN,
 )
 
@@ -210,3 +216,49 @@ async def test_options_flow_imperial_unit_label(
     schema = result["data_schema"]
     gap_key = next(key for key in schema.schema if str(key) == CONF_MIN_GAP)
     assert gap_key.default() == 4.0
+
+
+async def test_options_form_shows_coordination_defaults(
+    hass: HomeAssistant, loaded_wrapper: MockConfigEntry
+) -> None:
+    """An entry from before coordination sees every field at its default."""
+    result = await hass.config_entries.options.async_init(loaded_wrapper.entry_id)
+    assert result["type"] is FlowResultType.FORM
+
+    defaults = {str(key): key.default() for key in result["data_schema"].schema}
+    assert defaults[CONF_COORDINATE_MODES] is False
+    assert defaults[CONF_COORDINATION_GROUP] == "default"
+    assert defaults[CONF_COORDINATION_PRIORITY] == 0
+    assert defaults[CONF_THWARTED_HEAT_HOLD] == "off"
+    assert defaults[CONF_THWARTED_COOL_HOLD] == "off"
+    assert defaults[CONF_THWARTED_FAN_MODE] == ""
+
+
+async def test_options_flow_stores_coordination_and_reloads(
+    hass: HomeAssistant, loaded_wrapper: MockConfigEntry
+) -> None:
+    """Submitting the coordination fields stores them and reloads the entry."""
+    result = await hass.config_entries.options.async_init(loaded_wrapper.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_MIN_GAP: 2.0,
+            CONF_MIN_CYCLE_TIME: {"seconds": 900},
+            CONF_COORDINATE_MODES: True,
+            CONF_COORDINATION_GROUP: "house",
+            CONF_COORDINATION_PRIORITY: 3,
+            CONF_THWARTED_HEAT_HOLD: "fan_only",
+            CONF_THWARTED_COOL_HOLD: "off",
+            CONF_THWARTED_FAN_MODE: "high",
+        },
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert loaded_wrapper.options[CONF_COORDINATE_MODES] is True
+    assert loaded_wrapper.options[CONF_COORDINATION_GROUP] == "house"
+    assert loaded_wrapper.options[CONF_COORDINATION_PRIORITY] == 3
+    assert loaded_wrapper.options[CONF_THWARTED_HEAT_HOLD] == "fan_only"
+    assert loaded_wrapper.options[CONF_THWARTED_COOL_HOLD] == "off"
+    assert loaded_wrapper.options[CONF_THWARTED_FAN_MODE] == "high"
+    assert loaded_wrapper.state is ConfigEntryState.LOADED

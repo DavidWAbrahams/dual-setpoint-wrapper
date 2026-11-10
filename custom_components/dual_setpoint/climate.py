@@ -54,15 +54,28 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_COORDINATE_MODES,
+    CONF_COORDINATION_GROUP,
+    CONF_COORDINATION_PRIORITY,
     CONF_MIN_CYCLE_TIME,
     CONF_MIN_GAP,
     CONF_SOURCE_ENTITY,
+    CONF_THWARTED_COOL_HOLD,
+    CONF_THWARTED_FAN_MODE,
+    CONF_THWARTED_HEAT_HOLD,
+    DEFAULT_COORDINATION_GROUP,
+    DEFAULT_THWARTED_FAN_MODE,
+    DEFAULT_THWARTED_HOLD,
     DOMAIN,
     GAP_EPSILON,
     LOGGER,
     SETTLE_WINDOW,
+    THWARTED_HOLD_FAN_ONLY,
+    THWARTED_HOLD_OPTIONS,
+    Demand,
     cycle_seconds,
     default_min_gap,
+    get_coordinator,
     units_are_metric,
 )
 
@@ -72,6 +85,8 @@ if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import CALLBACK_TYPE, HomeAssistant, State
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
+
+    from .coordinator import ModeCoordinator
 
 # Core's own fallbacks are metric constants, so pick bounds per unit system.
 _FALLBACK_LIMITS = {
@@ -102,6 +117,20 @@ _PRECISION_EPSILON = 1e-6
 
 # Core's display steps, coarsest fractional to finest.
 _PRECISION_STEPS = (PRECISION_HALVES, PRECISION_TENTHS)
+
+# Source actions that mean the compressor is physically moving air in some
+# direction. The coordinator refuses to reverse the shared valve while any
+# group member reports one of these; IDLE/OFF/FAN (or no action at all, which
+# many minisplit integrations never publish) are what let a flip through.
+_RUNNING_ACTIONS = frozenset(
+    {
+        HVACAction.HEATING,
+        HVACAction.COOLING,
+        HVACAction.DRYING,
+        HVACAction.PREHEATING,
+        HVACAction.DEFROSTING,
+    }
+)
 
 _MIRRORED_FEATURES = (
     ClimateEntityFeature.FAN_MODE,
@@ -184,6 +213,23 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             seconds=cycle_seconds(entry.options.get(CONF_MIN_CYCLE_TIME))
         )
 
+        options = entry.options
+        self._coord_enabled = bool(options.get(CONF_COORDINATE_MODES, False))
+        self._group_name = str(
+            options.get(CONF_COORDINATION_GROUP) or DEFAULT_COORDINATION_GROUP
+        )
+        raw_priority = _as_float(options.get(CONF_COORDINATION_PRIORITY))
+        self._priority = int(raw_priority) if raw_priority is not None else 0
+        self._thwarted_heat_hold = str(
+            options.get(CONF_THWARTED_HEAT_HOLD) or DEFAULT_THWARTED_HOLD
+        )
+        self._thwarted_cool_hold = str(
+            options.get(CONF_THWARTED_COOL_HOLD) or DEFAULT_THWARTED_HOLD
+        )
+        self._thwarted_fan_mode = str(
+            options.get(CONF_THWARTED_FAN_MODE) or DEFAULT_THWARTED_FAN_MODE
+        )
+
         self._attr_unique_id = entry.entry_id
         self._attr_temperature_unit = hass.config.units.temperature_unit
 
@@ -206,6 +252,17 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         self._defer_unsub: CALLBACK_TYPE | None = None
         self._applying = False
         self._warned_no_reading = False
+
+        # Multi-zone coordination state. A parked member is the one state in
+        # which the face deliberately does NOT follow the source: the face
+        # keeps the user's mode while the source sits in a configured hold.
+        self._coordinator: ModeCoordinator | None = None
+        self._parked_hold: HVACMode | None = None
+        self._parked_from: Demand | None = None
+        self._parked_fan_set = False
+        self._pre_park_fan_mode: str | None = None
+        self._group_ctx: Demand | None = None
+        self._deferred_to: str | None = None
 
         self._attach_device(hass)
 
@@ -329,6 +386,10 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
     @property
     def hvac_action(self) -> HVACAction | None:
         """Mirror the source action."""
+        if self._parked_hold is not None:
+            # The parked source would report off/fan; that is our internal
+            # hold, not news for the card. The face's room is simply idle.
+            return HVACAction.IDLE
         action = self._source_attributes.get(ATTR_HVAC_ACTION)
         if action is None:
             return None
@@ -404,10 +465,27 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Expose the flip timestamp so it survives a restart."""
-        return {
+        attrs: dict[str, Any] = {
             "last_flip": self._last_flip.isoformat() if self._last_flip else None,
             "source_entity": self._source_entity_id,
         }
+        if self._coord_enabled:
+            attrs.update(
+                {
+                    "demand": self.coordination_demand().value,
+                    "group": self._group_name,
+                    "group_mode": (
+                        self._group_ctx.value if self._group_ctx is not None else None
+                    ),
+                    "deferred_to": self._deferred_to,
+                    "parked": (
+                        self._parked_hold.value
+                        if self._parked_hold is not None
+                        else None
+                    ),
+                }
+            )
+        return attrs
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -425,6 +503,10 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         )
         self.async_on_remove(self._cancel_timers)
 
+        if self._coord_enabled:
+            self._coordinator = get_coordinator(self.hass, self._group_name)
+            self._coordinator.register(self)
+
         # Seed from the source when we have nothing restored to work with.
         if self._attr_hvac_mode is None:
             self._mirror_source_state(initial=True)
@@ -432,6 +514,14 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         if self._attr_hvac_mode == HVACMode.HEAT_COOL:
             await self._async_evaluate(gate_flips=False)
         self.async_write_ha_state()
+        self._async_notify_coordinator()
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Leave the coordination group before the entity goes away."""
+        if self._coordinator is not None:
+            self._coordinator.unregister(self)
+            self._coordinator = None
+        await super().async_will_remove_from_hass()
 
     def _restore_owned_state(self, last_state: State | None) -> None:
         """Load the owned state, normalizing the gap."""
@@ -744,6 +834,11 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         UIs would display different setpoints indefinitely. The device's
         reading is the truth, so adopt it into the bound the command owned.
         """
+        if self._parked_hold is not None:
+            # The source sits in a hold we chose for the group; its state is
+            # our own echo, not a setpoint anyone picked. The face's bounds
+            # belong to the user while parked.
+            return
         if self._expected_bounds is not None:
             source_range = self._source_range()
             if source_range is not None:
@@ -778,6 +873,11 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         """Treat the source as authoritative when it never confirmed."""
         self._settle_unsub = None
         self._pending = False
+        if self._parked_hold is not None:
+            # A park command the source never echoed is fine: the face keeps
+            # the user's mode no matter what the parked source reports.
+            self.async_write_ha_state()
+            return
         self._mirror_source_state()
         self.async_write_ha_state()
         if self._attr_hvac_mode == HVACMode.HEAT_COOL:
@@ -798,6 +898,10 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         own, so it takes effect now even when the last flip was recent.
         """
         if self._applying or self._attr_hvac_mode != HVACMode.HEAT_COOL:
+            return
+        if self._parked_hold is not None:
+            # The group parked this member; its engine stays out of the way
+            # until the coordinator lifts the park.
             return
         if not self._available_for_command():
             return
@@ -876,6 +980,20 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
                 desired_mode,
             )
 
+        # While the group runs one direction, this member may not reverse the
+        # shared valve against it: keep whatever side the source is already
+        # running on. An idle or off source simply waits for the group to
+        # come around to its side.
+        if (
+            self._group_ctx in (Demand.HEAT, Demand.COOL)
+            and desired_mode != self._group_ctx
+            and not auto_recovery
+        ):
+            hold = self._hold_on_current_side(state.state)
+            if hold is None:
+                return
+            desired_mode, desired_temp = hold
+
         flip_needed = state.state != desired_mode
 
         if (
@@ -952,6 +1070,7 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         new_state = event.data["new_state"]
         if new_state is None or new_state.state in UNAVAILABLE_STATES:
             self.async_write_ha_state()
+            self._async_notify_coordinator()
             return
 
         if self._attr_hvac_mode is None:
@@ -969,12 +1088,22 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
                 self._source_entity_id,
                 new_state.state,
             )
+            if self._parked_hold is not None:
+                # Somebody used the remote on the parked unit. Honour that in
+                # the moment: drop the park and mirror what they did. The
+                # coordinator wakes below and re-parks only if the group
+                # still runs the other way.
+                self._parked_hold = None
+                self._parked_from = None
+                self._parked_fan_set = False
+                self._pre_park_fan_mode = None
             self._cancel_pending_flip()
             self._mirror_source_state()
         self.async_write_ha_state()
 
         if self._attr_hvac_mode == HVACMode.HEAT_COOL:
             self.hass.async_create_task(self._async_evaluate(gate_flips=True))
+        self._async_notify_coordinator()
 
     def _cancel_pending_flip(self) -> None:
         """Drop a deferred flip that an external change superseded."""
@@ -1038,6 +1167,10 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
 
     def _mirror_source_state(self, *, initial: bool = False) -> None:
         """Adopt the source's mode and setpoints as our own."""
+        if self._parked_hold is not None and not initial:
+            # While parked the face deliberately diverges from the source:
+            # echoing the hold onto the card would overwrite the user's mode.
+            return
         state = self._source_state
         if state is None or state.state in UNAVAILABLE_STATES:
             return
@@ -1117,9 +1250,14 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         """Handle a mode change."""
         if hvac_mode == self._attr_hvac_mode:
             return
+        if self._parked_hold is not None:
+            # A command through the card is the user speaking: drop the park
+            # without re-asserting the old state and let the new mode stand.
+            await self.async_release_park(reapply=False)
 
         if hvac_mode == HVACMode.HEAT_COOL:
             await self._async_enter_heat_cool()
+            self._async_notify_coordinator()
             return
 
         self._cancel_pending_flip()
@@ -1142,6 +1280,7 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         else:
             await self._async_command(hvac_mode, None)
         self.async_write_ha_state()
+        self._async_notify_coordinator()
 
     async def _async_enter_heat_cool(self) -> None:
         """Switch into heat_cool and apply the decision immediately."""
@@ -1164,6 +1303,10 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
         """Handle a temperature change, enforcing the minimum gap."""
+        if self._parked_hold is not None:
+            # A setpoint edit is the user re-engaging this room: release the
+            # park and let re-arbitration decide what happens next.
+            await self.async_release_park(reapply=False)
         if (new_mode := kwargs.get(ATTR_HVAC_MODE)) is not None and (
             new_mode != self._attr_hvac_mode
         ):
@@ -1177,6 +1320,7 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             await self._async_set_range(low, high)
         elif temperature is not None:
             await self._async_set_single(temperature)
+        self._async_notify_coordinator()
 
     async def _async_set_range(self, low: float, high: float) -> None:
         """Validate and store a heat_cool range."""
@@ -1264,6 +1408,235 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             context=self._context,
         )
         self.async_write_ha_state()
+
+    # ------------------------------------------------------------------
+    # Multi-zone coordination (GroupMember surface for ModeCoordinator)
+    # ------------------------------------------------------------------
+    @property
+    def coordination_available(self) -> bool:
+        """Report demand only while the source answers."""
+        return self._source_available
+
+    @property
+    def coordination_priority(self) -> int:
+        """Return this member's arbitration tie-break priority."""
+        return self._priority
+
+    @property
+    def coordination_parkable(self) -> bool:
+        """Native dual-setpoint sources hold both sides and never park."""
+        return not self._source_native_range
+
+    @property
+    def coordination_parked(self) -> bool:
+        """Return True while the group holds this member's source."""
+        return self._parked_hold is not None
+
+    def coordination_demand(self) -> Demand:
+        """
+        Return what this member's room needs, independent of its park.
+
+        Demand comes from the face's owned state and the mirrored room
+        reading, never from what a parked source is sitting in: the face
+        keeps the user's mode through a park, and the room keeps reporting.
+        """
+        mode = self._attr_hvac_mode
+        if mode is None or mode in (HVACMode.OFF, HVACMode.FAN_ONLY):
+            return Demand.NONE
+        if mode == HVACMode.DRY:
+            return Demand.COOL
+        reading = self.current_temperature
+        if reading is None:
+            return Demand.NONE
+        low = self._target_temp_low
+        high = self._target_temp_high
+        if low is None:
+            low = self._target_temp if self._target_temp is not None else reading
+        if high is None:
+            high = self._target_temp if self._target_temp is not None else reading
+        # Which side is the room pressing? Outside its own deadband (or, for
+        # heat_cool, anywhere inside the whole band) the room is satisfied.
+        if mode == HVACMode.HEAT:
+            pressed = reading < low
+        elif mode == HVACMode.COOL:
+            pressed = reading > high
+        else:
+            # heat_cool: the room wants whichever side of the band it crossed.
+            pressed = reading < low or reading > high
+        if not pressed:
+            return Demand.IDLE
+        return Demand.HEAT if reading < low else Demand.COOL
+
+    def coordination_intent(self) -> Demand | None:
+        """Return the direction this member will push for while active."""
+        mode = self._attr_hvac_mode
+        if mode == HVACMode.HEAT:
+            return Demand.HEAT
+        if mode in (HVACMode.COOL, HVACMode.DRY):
+            return Demand.COOL
+        if mode == HVACMode.HEAT_COOL:
+            demand = self.coordination_demand()
+            return demand if demand in (Demand.HEAT, Demand.COOL) else None
+        return None
+
+    def coordination_held_mode(self) -> Demand | None:
+        """Return the direction the source itself is currently set to."""
+        state = self._source_state
+        if state is None:
+            return None
+        try:
+            mode = HVACMode(state.state)
+        except ValueError:
+            return None
+        if mode == HVACMode.HEAT:
+            return Demand.HEAT
+        if mode in (HVACMode.COOL, HVACMode.DRY):
+            return Demand.COOL
+        return None
+
+    def coordination_source_running(self) -> bool:
+        """Return True when this member's source is physically running."""
+        action = self._source_attributes.get(ATTR_HVAC_ACTION)
+        if action is None:
+            return False
+        try:
+            return HVACAction(action) in _RUNNING_ACTIONS
+        except ValueError:
+            return False
+
+    def coordination_cycle_seconds(self) -> int:
+        """Return this member's compressor protection window."""
+        return int(self._min_cycle_time.total_seconds())
+
+    def async_group_context_changed(
+        self, group_mode: Demand | None, deferred_to: str | None
+    ) -> None:
+        """Record the group's decision for the engine pin and the card."""
+        self._group_ctx = group_mode
+        self._deferred_to = deferred_to
+        self.async_write_ha_state()
+
+    def _async_notify_coordinator(self) -> None:
+        """Tell the group that this member's demand may have changed."""
+        if self._coordinator is None:
+            return
+        self.hass.async_create_task(self._coordinator.async_member_updated(self))
+
+    async def async_park_for_group(self, thwarted_from: Demand) -> None:
+        """
+        Put the source in a configured hold while the group runs the other way.
+
+        Only the source parks; the face keeps whatever the user set and the
+        card shows the room as idle. Repeated parks in the same direction are
+        ignored so arbitration cannot chatter at the device.
+        """
+        source_state = self._source_state
+        if (
+            self._parked_hold is not None
+            and self._parked_from is thwarted_from
+            and source_state is not None
+            and source_state.state == self._parked_hold
+        ):
+            # Already parked in this direction and the source proves it. An
+            # earlier park whose command was lost to an unavailable source
+            # must still be re-applied once the device answers again.
+            return
+
+        hold_option = (
+            self._thwarted_cool_hold
+            if thwarted_from is Demand.COOL
+            else self._thwarted_heat_hold
+        )
+        if hold_option not in THWARTED_HOLD_OPTIONS:
+            hold_option = DEFAULT_THWARTED_HOLD
+        hold = (
+            HVACMode.FAN_ONLY if hold_option == THWARTED_HOLD_FAN_ONLY else HVACMode.OFF
+        )
+        if hold is HVACMode.FAN_ONLY and HVACMode.FAN_ONLY not in self.hvac_modes:
+            LOGGER.warning(
+                "%s does not offer fan_only; parking off instead of fan_only",
+                self._source_entity_id,
+            )
+            hold = HVACMode.OFF
+
+        self._parked_hold = hold
+        self._parked_from = thwarted_from
+        self._pre_park_fan_mode = self.fan_mode
+        self._cancel_pending_flip()
+
+        self._applying = True
+        try:
+            await self._async_command(hold, None)
+            # _async_command reports True only when nothing needed sending,
+            # so "sent" and "failed" both read as False. The source's own
+            # state is the honest check that the hold is in place before we
+            # spend a second call on fan speed.
+            source_state = self._source_state
+            if (
+                hold is HVACMode.FAN_ONLY
+                and self._thwarted_fan_mode
+                and source_state is not None
+                and source_state.state == hold
+            ):
+                await self.hass.services.async_call(
+                    "climate",
+                    "set_fan_mode",
+                    {
+                        ATTR_ENTITY_ID: self._source_entity_id,
+                        ATTR_FAN_MODE: self._thwarted_fan_mode,
+                    },
+                    blocking=True,
+                    context=self._context,
+                )
+                self._parked_fan_set = True
+        finally:
+            self._applying = False
+        self.async_write_ha_state()
+
+    async def async_release_park(self, *, reapply: bool = True) -> None:
+        """
+        Lift a park and re-assert the room unless the user has spoken.
+
+        With reapply the member immediately re-commands whatever its face
+        says it wants (its own cycle-time gate still applies); without it the
+        caller — a direct user command in the same method — takes over.
+        """
+        if self._parked_hold is None:
+            return
+        self._parked_hold = None
+        self._parked_from = None
+        restore_fan = self._parked_fan_set
+        saved_fan = self._pre_park_fan_mode
+        self._parked_fan_set = False
+        self._pre_park_fan_mode = None
+
+        self._applying = True
+        try:
+            mode = self._attr_hvac_mode if reapply else None
+            if mode in (HVACMode.HEAT, HVACMode.COOL, HVACMode.DRY):
+                bound = (
+                    self._target_temp_low
+                    if mode == HVACMode.HEAT
+                    else self._target_temp_high
+                )
+                temp = self._target_temp if self._target_temp is not None else bound
+                await self._async_command(mode, temp)
+            if restore_fan and saved_fan is not None:
+                await self.hass.services.async_call(
+                    "climate",
+                    "set_fan_mode",
+                    {
+                        ATTR_ENTITY_ID: self._source_entity_id,
+                        ATTR_FAN_MODE: saved_fan,
+                    },
+                    blocking=True,
+                    context=self._context,
+                )
+        finally:
+            self._applying = False
+        self.async_write_ha_state()
+        if reapply and self._attr_hvac_mode == HVACMode.HEAT_COOL:
+            await self._async_evaluate(gate_flips=True)
 
 
 async def async_setup_entry(

@@ -13,6 +13,9 @@ import pytest
 import pytest_socket
 from homeassistant.components.climate import (
     ATTR_CURRENT_TEMPERATURE,
+    ATTR_FAN_MODE,
+    ATTR_FAN_MODES,
+    ATTR_HVAC_ACTION,
     ATTR_HVAC_MODE,
     ATTR_HVAC_MODES,
     ATTR_MAX_TEMP,
@@ -26,6 +29,7 @@ from homeassistant.components.climate import (
 )
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import (
+    ATTR_ENTITY_ID,
     ATTR_FRIENDLY_NAME,
     ATTR_SUPPORTED_FEATURES,
     STATE_UNAVAILABLE,
@@ -61,6 +65,11 @@ if os.name != "posix":
     pytest_socket.disable_socket = _disable_socket
 
 
+# Where the live FakeThermostats publish themselves on a given hass so the
+# climate service handlers can route a call to the fake owning the target.
+_FAKE_REGISTRY = "_dual_setpoint_fake_thermostats"
+
+
 @pytest.fixture(autouse=True)
 def auto_enable_custom_integrations(enable_custom_integrations: None) -> None:
     """Allow our custom integration to load in every test."""
@@ -83,9 +92,17 @@ class FakeThermostat:
         wrapper can delegate the pair to.
     """
 
-    def __init__(self, hass: HomeAssistant) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entity_id: str = SOURCE_ENTITY,
+        *,
+        friendly_name: str = "Thermostat",
+    ) -> None:
         """Register the climate.set_temperature service we answer to."""
         self.hass = hass
+        self.entity_id = entity_id
+        self.friendly_name = friendly_name
         self.mode: HVACMode = HVACMode.HEAT
         self.temperature: float = 21.0
         self.current_temperature: float = 20.0
@@ -98,30 +115,63 @@ class FakeThermostat:
         self.native_range: bool = False
         self.low_temp: float = 18.0
         self.high_temp: float = 24.0
+        # Optional extras some coordination scenarios need; all default to
+        # "the source does not report this", matching what every existing
+        # test has always seen.
+        self.hvac_action: str | None = None
+        self.fan_only: bool = False
+        self.fan_modes: list[str] | None = None
+        self.fan_mode: str | None = None
         self.set_temperature_calls: list[dict[str, Any]] = []
         self.set_hvac_mode_calls: list[dict[str, Any]] = []
+        self.set_fan_mode_calls: list[dict[str, Any]] = []
         self.register_service()
 
     def register_service(self) -> None:
-        """(Re-)register the climate services we answer to."""
+        """
+        (Re-)register the climate services we answer to.
+
+        The handlers route by entity id through a per-hass registry so
+        several fakes can coexist, each answering only for its own source.
+        """
+        registry: dict[str, FakeThermostat] = self.hass.data.setdefault(
+            _FAKE_REGISTRY, {}
+        )
+        registry[self.entity_id] = self
+
+        def _route(handler: str) -> Callable[[ServiceCall], Awaitable[None]]:
+            async def _handle(call: ServiceCall) -> None:
+                target = registry.get(str(call.data.get(ATTR_ENTITY_ID)))
+                if target is not None:
+                    await getattr(target, handler)(call)
+
+            return _handle
+
         self.hass.services.async_register(
-            "climate", "set_temperature", self._async_handle_set_temperature
+            "climate", "set_temperature", _route("_async_handle_set_temperature")
         )
         self.hass.services.async_register(
-            "climate", "set_hvac_mode", self._async_handle_set_hvac_mode
+            "climate", "set_hvac_mode", _route("_async_handle_set_hvac_mode")
+        )
+        self.hass.services.async_register(
+            "climate", "set_fan_mode", _route("_async_handle_set_fan_mode")
         )
 
     @property
     def attributes(self) -> dict[str, Any]:
         """Return the attributes the source reports."""
         modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL]
+        if self.fan_only:
+            modes.append(HVACMode.FAN_ONLY)
         if self.expose_heat_cool or self.native_range:
             modes.append(HVACMode.HEAT_COOL)
-        features = 0
+        features = ClimateEntityFeature(0)
         if self.native_range:
-            features = ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+            features |= ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+        if self.fan_modes:
+            features |= ClimateEntityFeature.FAN_MODE
         attrs: dict[str, Any] = {
-            ATTR_FRIENDLY_NAME: "Thermostat",
+            ATTR_FRIENDLY_NAME: self.friendly_name,
             ATTR_HVAC_MODES: modes,
             ATTR_MIN_TEMP: self.min_temp,
             ATTR_MAX_TEMP: self.max_temp,
@@ -133,6 +183,11 @@ class FakeThermostat:
         if self.native_range:
             attrs[ATTR_TARGET_TEMP_LOW] = self.low_temp
             attrs[ATTR_TARGET_TEMP_HIGH] = self.high_temp
+        if self.hvac_action is not None:
+            attrs[ATTR_HVAC_ACTION] = self.hvac_action
+        if self.fan_modes:
+            attrs[ATTR_FAN_MODES] = self.fan_modes
+            attrs[ATTR_FAN_MODE] = self.fan_mode or self.fan_modes[0]
         return attrs
 
     def seed(self) -> None:
@@ -141,16 +196,16 @@ class FakeThermostat:
 
     def _push(self) -> None:
         if not self.online:
-            self.hass.states.async_set(SOURCE_ENTITY, STATE_UNAVAILABLE, {})
+            self.hass.states.async_set(self.entity_id, STATE_UNAVAILABLE, {})
             return
-        self.hass.states.async_set(SOURCE_ENTITY, self.mode, self.attributes)
+        self.hass.states.async_set(self.entity_id, self.mode, self.attributes)
 
     def set_online(self, online: bool) -> None:
         """Flip the source between available and unavailable."""
         self.online = online
         self._push()
 
-    def external_set(
+    def external_set(  # noqa: PLR0913
         self,
         *,
         mode: HVACMode | None = None,
@@ -158,6 +213,7 @@ class FakeThermostat:
         current: float | None = None,
         low: float | None = None,
         high: float | None = None,
+        action: str | None = None,
     ) -> None:
         """Change the source the way a remote, app, or UI would."""
         if mode is not None:
@@ -170,6 +226,8 @@ class FakeThermostat:
             self.low_temp = low
         if high is not None:
             self.high_temp = high
+        if action is not None:
+            self.hvac_action = action
         self._push()
 
     async def _async_handle_set_temperature(self, call: ServiceCall) -> None:
@@ -202,6 +260,14 @@ class FakeThermostat:
         self.set_hvac_mode_calls.append(dict(call.data))
         if (mode := call.data.get(ATTR_HVAC_MODE)) is not None:
             self.mode = HVACMode(mode)
+        if self.echo:
+            self._push()
+
+    async def _async_handle_set_fan_mode(self, call: ServiceCall) -> None:
+        """Answer a fan speed command and echo new state."""
+        self.set_fan_mode_calls.append(dict(call.data))
+        if (fan := call.data.get(ATTR_FAN_MODE)) is not None:
+            self.fan_mode = str(fan)
         if self.echo:
             self._push()
 
@@ -257,6 +323,7 @@ def create_wrapper(
         min_cycle: int = 900,
         seed: bool = True,
         last_state: State | None = None,
+        options: dict[str, Any] | None = None,
     ) -> MockConfigEntry:
         if seed:
             thermostat.seed()
@@ -265,7 +332,11 @@ def create_wrapper(
             title="Thermostat",
             entry_id=ENTRY_ID,
             data={CONF_SOURCE_ENTITY: SOURCE_ENTITY},
-            options={CONF_MIN_GAP: min_gap, CONF_MIN_CYCLE_TIME: min_cycle},
+            options={
+                CONF_MIN_GAP: min_gap,
+                CONF_MIN_CYCLE_TIME: min_cycle,
+                **(options or {}),
+            },
         )
         entry.add_to_hass(hass)
         if last_state is not None:

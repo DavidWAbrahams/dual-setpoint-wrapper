@@ -25,11 +25,21 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import selector
 
 from .const import (
+    CONF_COORDINATE_MODES,
+    CONF_COORDINATION_GROUP,
+    CONF_COORDINATION_PRIORITY,
     CONF_MIN_CYCLE_TIME,
     CONF_MIN_GAP,
     CONF_SOURCE_ENTITY,
+    CONF_THWARTED_COOL_HOLD,
+    CONF_THWARTED_FAN_MODE,
+    CONF_THWARTED_HEAT_HOLD,
+    DEFAULT_COORDINATION_GROUP,
     DEFAULT_MIN_CYCLE_TIME,
+    DEFAULT_THWARTED_FAN_MODE,
+    DEFAULT_THWARTED_HOLD,
     DOMAIN,
+    THWARTED_HOLD_OPTIONS,
     cycle_seconds,
     default_min_gap,
     units_are_metric,
@@ -54,6 +64,30 @@ def _min_gap_default(options: dict[str, Any] | None, *, is_metric: bool) -> floa
 def _cycle_seconds(options: dict[str, Any] | None) -> int:
     """Return the stored cycle time in seconds, or the default."""
     return cycle_seconds((options or {}).get(CONF_MIN_CYCLE_TIME))
+
+
+def _coordination_defaults(options: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the stored coordination options with every default filled in."""
+    stored = options or {}
+    priority = stored.get(CONF_COORDINATION_PRIORITY)
+    if not isinstance(priority, (int, float)) or isinstance(priority, bool):
+        priority = 0
+    return {
+        CONF_COORDINATE_MODES: bool(stored.get(CONF_COORDINATE_MODES, False)),
+        CONF_COORDINATION_GROUP: str(
+            stored.get(CONF_COORDINATION_GROUP) or DEFAULT_COORDINATION_GROUP
+        ),
+        CONF_COORDINATION_PRIORITY: int(priority),
+        CONF_THWARTED_HEAT_HOLD: str(
+            stored.get(CONF_THWARTED_HEAT_HOLD) or DEFAULT_THWARTED_HOLD
+        ),
+        CONF_THWARTED_COOL_HOLD: str(
+            stored.get(CONF_THWARTED_COOL_HOLD) or DEFAULT_THWARTED_HOLD
+        ),
+        CONF_THWARTED_FAN_MODE: str(
+            stored.get(CONF_THWARTED_FAN_MODE) or DEFAULT_THWARTED_FAN_MODE
+        ),
+    }
 
 
 class DualSetpointConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -154,6 +188,7 @@ class DualSetpointOptionsFlow(OptionsFlow):
 
         options = self.config_entry.options
         is_metric = units_are_metric(self.hass.config.units)
+        coordination = _coordination_defaults(options)
 
         return self.async_show_form(
             step_id="init",
@@ -178,6 +213,50 @@ class DualSetpointOptionsFlow(OptionsFlow):
                         # this only adds the day field.
                         selector.DurationSelectorConfig(enable_day=True),
                     ),
+                    # Multi-zone coordination is off by default, and every
+                    # field carries a default so a submission made before
+                    # these existed keeps working unchanged.
+                    vol.Optional(
+                        CONF_COORDINATE_MODES,
+                        default=coordination[CONF_COORDINATE_MODES],
+                    ): selector.BooleanSelector(),
+                    vol.Optional(
+                        CONF_COORDINATION_GROUP,
+                        default=coordination[CONF_COORDINATION_GROUP],
+                    ): selector.TextSelector(),
+                    vol.Optional(
+                        CONF_COORDINATION_PRIORITY,
+                        default=coordination[CONF_COORDINATION_PRIORITY],
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=-10,
+                            max=10,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        ),
+                    ),
+                    vol.Optional(
+                        CONF_THWARTED_HEAT_HOLD,
+                        default=coordination[CONF_THWARTED_HEAT_HOLD],
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=list(THWARTED_HOLD_OPTIONS),
+                            mode=selector.SelectSelectorMode.DROPDOWN,
+                        ),
+                    ),
+                    vol.Optional(
+                        CONF_THWARTED_COOL_HOLD,
+                        default=coordination[CONF_THWARTED_COOL_HOLD],
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=list(THWARTED_HOLD_OPTIONS),
+                            mode=selector.SelectSelectorMode.DROPDOWN,
+                        ),
+                    ),
+                    vol.Optional(
+                        CONF_THWARTED_FAN_MODE,
+                        default=coordination[CONF_THWARTED_FAN_MODE],
+                    ): selector.TextSelector(),
                 },
             ),
         )
