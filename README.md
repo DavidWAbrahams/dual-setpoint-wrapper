@@ -89,10 +89,14 @@ configurable fan speed, using separate choices for "blocked while wanting to
 heat" and "blocked while wanting to cool" (**Hold when heating/cooling is
 blocked**, **Fan speed while held**). If the device has no `fan_only` mode the
 hold degrades to `off`. Parking only ever touches the source's mode — never
-its setpoints.
+its setpoints. A room that is simply _satisfied_ is never parked, even if its
+source still sits idly set to the opposite direction — only rooms that
+actually press (or are physically running) the wrong way get held.
 
 When the group comes around to your side, the source is released back to
-exactly what the face says it wants. A command issued through the wrapper
+exactly what the face says it wants; a released room that is satisfied in
+`heat_cool` follows the group's direction instead of stranding in the hold.
+A command issued through the wrapper
 (card/automation) always wins: it lifts the park and the group will simply
 re-park later if the room still opposes. Using the vendor remote on a parked
 indoor unit also lifts the park immediately (the user in the moment wins), but

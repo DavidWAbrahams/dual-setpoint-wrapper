@@ -239,6 +239,11 @@ class ModeCoordinator:
                 self._group_mode = target
                 self._last_change = now
 
+            # Publish the group's decision first: a member released below may
+            # consult it to decide which side its source should follow.
+            for member in active:
+                member.async_group_context_changed(target, deferred_to)
+
             for member in active:
                 demand = self._demand_of(member)
                 # Never park the member whose own demand is the group's
@@ -254,7 +259,15 @@ class ModeCoordinator:
                     and (
                         demand is OPPOSITE[target]
                         or member.coordination_intent() is OPPOSITE[target]
-                        or member.coordination_held_mode() is OPPOSITE[target]
+                        # A source merely *set* the old way is harmless while
+                        # it sits idle: it cannot fight the valve until it runs
+                        # (and the moment it does, this loop parks it again).
+                        # Only a source actually running the wrong direction
+                        # threatens the shared valve.
+                        or (
+                            member.coordination_held_mode() is OPPOSITE[target]
+                            and member.coordination_source_running()
+                        )
                     )
                 )
                 if conflicting:
@@ -275,9 +288,6 @@ class ModeCoordinator:
                     await member.async_park_for_group(thwarted_from)
                 elif member.coordination_parked:
                     await member.async_release_park()
-
-            for member in active:
-                member.async_group_context_changed(target, deferred_to)
         finally:
             self._applying = False
 

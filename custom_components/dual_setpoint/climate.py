@@ -1648,6 +1648,7 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         if self._parked_hold is None:
             return
         self._parked_hold = None
+        parked_from = self._parked_from
         self._parked_from = None
         restore_fan = self._parked_fan_set
         saved_fan = self._pre_park_fan_mode
@@ -1665,6 +1666,23 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
                 )
                 temp = self._target_temp if self._target_temp is not None else bound
                 await self._async_command(mode, temp)
+            elif mode == HVACMode.HEAT_COOL:
+                # A satisfied heat_cool room presses neither side, so its own
+                # engine would send nothing and the source would stay stranded
+                # in the hold. Send it the side the group is running instead:
+                # an idle head follows the group rather than idling in fan.
+                side = (
+                    self._group_ctx
+                    if self._group_ctx in (Demand.HEAT, Demand.COOL)
+                    else parked_from
+                )
+                if side is not None:
+                    await self._async_command(
+                        HVACMode.HEAT if side is Demand.HEAT else HVACMode.COOL,
+                        self._target_temp_low
+                        if side is Demand.HEAT
+                        else self._target_temp_high,
+                    )
             if restore_fan and saved_fan is not None:
                 await self.hass.services.async_call(
                     "climate",

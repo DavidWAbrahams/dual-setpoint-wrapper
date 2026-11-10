@@ -399,6 +399,66 @@ async def test_card_command_releases_the_park(
     assert office.set_hvac_mode_calls == []
 
 
+async def test_idle_source_in_old_direction_is_not_parked(
+    hass: HomeAssistant,
+) -> None:
+    """A satisfied member keeps a leftover source mode; only running hurts."""
+    pair = await _make_pair(hass, min_cycle=0)
+    bedroom_entity, office_entity = pair["bedroom_entity"], pair["office_entity"]
+    office = pair["office"]
+
+    # The office joins heat_cool still cooling its hot room, then the room
+    # settles: the face is satisfied but its source is still set to cool.
+    await office_entity.async_set_hvac_mode(HVACMode.HEAT_COOL)
+    office.external_set(current=25.0)
+    await hass.async_block_till_done()
+    assert hass.states.get(OFFICE_SOURCE).state == HVACMode.COOL
+    assert office_entity.coordination_demand() is Demand.IDLE
+
+    # The bedroom's mature heat claim takes the valve.
+    _backdate_demand(bedroom_entity, bedroom_entity.entity_id, 10)
+    await _arbitrate(hass, bedroom_entity)
+    assert hass.states.get(office_entity.entity_id).attributes["group_mode"] == "heat"
+
+    # The office follows the group instead of being parked: an idle source
+    # left in the old direction cannot fight the shared valve.
+    assert _parked(hass, office_entity) is None
+    assert hass.states.get(OFFICE_SOURCE).state == HVACMode.COOL
+
+
+async def test_release_of_satisfied_member_follows_the_group(
+    hass: HomeAssistant,
+) -> None:
+    """A released, satisfied heat_cool room follows the group's direction."""
+    pair = await _make_pair(hass, min_cycle=0)
+    bedroom_entity, office_entity = pair["bedroom_entity"], pair["office_entity"]
+    office = pair["office"]
+
+    await office_entity.async_set_hvac_mode(HVACMode.HEAT_COOL)
+    await hass.async_block_till_done()
+
+    # The bedroom's mature heat claim takes the valve; the office, still
+    # pressing for cool, parks at the configured hold.
+    _backdate_demand(bedroom_entity, bedroom_entity.entity_id, 10)
+    await _arbitrate(hass, bedroom_entity)
+    assert _parked(hass, office_entity) == "off"
+    assert hass.states.get(OFFICE_SOURCE).state == HVACMode.OFF
+
+    # The office room settles: it no longer conflicts, so the group releases
+    # it while the group still runs heat.
+    office.external_set(current=25.0)
+    await hass.async_block_till_done()
+    await _arbitrate(hass, office_entity)
+
+    # The release does not strand the source in the hold: a satisfied
+    # heat_cool room follows the group's side instead, idle-heat at its low
+    # bound, rather than pressing anything.
+    assert _parked(hass, office_entity) is None
+    assert hass.states.get(OFFICE_SOURCE).state == HVACMode.HEAT
+    assert office_entity.coordination_demand() is Demand.IDLE
+    assert hass.states.get(office_entity.entity_id).attributes["group_mode"] == "heat"
+
+
 async def test_remote_override_of_a_parked_unit_is_reparked(
     hass: HomeAssistant,
 ) -> None:
