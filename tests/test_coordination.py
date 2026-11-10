@@ -452,6 +452,33 @@ async def test_running_member_blocks_the_flip(hass: HomeAssistant) -> None:
     assert hass.states.get(OFFICE_SOURCE).state == HVACMode.COOL
 
 
+async def test_awarded_member_running_does_not_gate_the_flip(
+    hass: HomeAssistant,
+) -> None:
+    """The member winning its own direction is exempt from the quiet gate."""
+    pair = await _make_pair(hass, min_cycle=0)
+    bedroom_entity, office_entity = pair["bedroom_entity"], pair["office_entity"]
+    office = pair["office"]
+
+    # The office unit is already cooling its hot room: the very compressor
+    # the group is about to award to the office is physically running.
+    office.external_set(action="cooling")
+    await hass.async_block_till_done()
+
+    # Both claims have persisted long enough to claim the valve; the
+    # office's cool claim is the older of the two.
+    _backdate_demand(office_entity, office_entity.entity_id, 10)
+    _backdate_demand(office_entity, bedroom_entity.entity_id, 5)
+    await _arbitrate(hass, office_entity)
+
+    # The flip goes through at once: awarding the office its own direction
+    # sends it no commands, so its running compressor protects nothing.
+    office_state = hass.states.get(office_entity.entity_id)
+    assert office_state.attributes["group_mode"] == "cool"
+    assert office_state.attributes["deferred_to"] == office_entity.entity_id
+    assert _parked(hass, bedroom_entity) == "off"
+
+
 async def test_cycle_time_gates_the_group_flip(hass: HomeAssistant) -> None:
     """The group waits out the longest member's cycle time before reversing."""
     pair = await _make_pair(hass, min_cycle=900)

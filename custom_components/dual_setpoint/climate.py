@@ -119,8 +119,9 @@ _PRECISION_EPSILON = 1e-6
 _PRECISION_STEPS = (PRECISION_HALVES, PRECISION_TENTHS)
 
 # Source actions that mean the compressor is physically moving air in some
-# direction. The coordinator refuses to reverse the shared valve while any
-# group member reports one of these; IDLE/OFF/FAN (or no action at all, which
+# direction. The coordinator refuses to reverse the shared valve while a
+# losing group member reports one of these; the awarded member may already
+# run the awarded direction, and IDLE/OFF/FAN (or no action at all, which
 # many minisplit integrations never publish) are what let a flip through.
 _RUNNING_ACTIONS = frozenset(
     {
@@ -193,6 +194,15 @@ def _observed_precision(values: Iterable[Any]) -> float | None:
     return needed
 
 
+# Core's non-deprecated temperature surface: newer cores want the native_*
+# names and convert from our declared native unit into the display unit,
+# while older cores only know the legacy names. Every temperature this
+# entity handles arrives already in the system's display unit (we mirror
+# source attributes, which are display-unit values), so declaring that unit
+# as our native one makes any conversion by core an identity.
+_NATIVE_CLIMATE_API = hasattr(ClimateEntity, "native_current_temperature")
+
+
 class DualSetpointClimate(ClimateEntity, RestoreEntity):
     """Expose heat_cool on top of a single-setpoint climate entity."""
 
@@ -231,7 +241,11 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         )
 
         self._attr_unique_id = entry.entry_id
-        self._attr_temperature_unit = hass.config.units.temperature_unit
+        self._face_temperature_unit = str(hass.config.units.temperature_unit)
+        if _NATIVE_CLIMATE_API:
+            self._attr_native_temperature_unit = self._face_temperature_unit
+        else:
+            self._attr_temperature_unit = self._face_temperature_unit
 
         # Owned state
         self._attr_hvac_mode: HVACMode | None = None
@@ -346,24 +360,33 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         """Mirror the source minimum."""
         if (value := _as_float(self._source_attributes.get(ATTR_MIN_TEMP))) is not None:
             return value
-        return _FALLBACK_LIMITS[self.temperature_unit][0]
+        return _FALLBACK_LIMITS[self._face_temperature_unit][0]
 
     @property
     def max_temp(self) -> float:
         """Mirror the source maximum."""
         if (value := _as_float(self._source_attributes.get(ATTR_MAX_TEMP))) is not None:
             return value
-        return _FALLBACK_LIMITS[self.temperature_unit][1]
+        return _FALLBACK_LIMITS[self._face_temperature_unit][1]
 
     @property
     def target_temperature_step(self) -> float | None:
         """Mirror the source step."""
         return _as_float(self._source_attributes.get(ATTR_TARGET_TEMP_STEP))
 
-    @property
-    def current_temperature(self) -> float | None:
-        """Mirror the source reading."""
-        return _as_float(self._source_attributes.get(ATTR_CURRENT_TEMPERATURE))
+    if _NATIVE_CLIMATE_API:
+
+        @property
+        def native_current_temperature(self) -> float | None:
+            """Mirror the source reading."""
+            return _as_float(self._source_attributes.get(ATTR_CURRENT_TEMPERATURE))
+
+    else:
+
+        @property
+        def current_temperature(self) -> float | None:
+            """Mirror the source reading."""
+            return _as_float(self._source_attributes.get(ATTR_CURRENT_TEMPERATURE))
 
     @property
     def precision(self) -> float:
@@ -397,22 +420,43 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             return HVACAction(action)
         return None
 
-    @property
-    def target_temperature(self) -> float | None:
-        """Return the single target, unused while in heat_cool."""
-        if self._attr_hvac_mode == HVACMode.HEAT_COOL:
-            return None
-        return self._target_temp
+    if _NATIVE_CLIMATE_API:
 
-    @property
-    def target_temperature_low(self) -> float | None:
-        """Return the heating setpoint."""
-        return self._target_temp_low
+        @property
+        def native_target_temperature(self) -> float | None:
+            """Return the single target, unused while in heat_cool."""
+            if self._attr_hvac_mode == HVACMode.HEAT_COOL:
+                return None
+            return self._target_temp
 
-    @property
-    def target_temperature_high(self) -> float | None:
-        """Return the cooling setpoint."""
-        return self._target_temp_high
+        @property
+        def native_target_temperature_low(self) -> float | None:
+            """Return the heating setpoint."""
+            return self._target_temp_low
+
+        @property
+        def native_target_temperature_high(self) -> float | None:
+            """Return the cooling setpoint."""
+            return self._target_temp_high
+
+    else:
+
+        @property
+        def target_temperature(self) -> float | None:
+            """Return the single target, unused while in heat_cool."""
+            if self._attr_hvac_mode == HVACMode.HEAT_COOL:
+                return None
+            return self._target_temp
+
+        @property
+        def target_temperature_low(self) -> float | None:
+            """Return the heating setpoint."""
+            return self._target_temp_low
+
+        @property
+        def target_temperature_high(self) -> float | None:
+            """Return the cooling setpoint."""
+            return self._target_temp_high
 
     @property
     def fan_mode(self) -> str | None:
@@ -1330,7 +1374,7 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
                 translation_key="gap_too_small",
                 translation_placeholders={
                     "min_gap": f"{self._min_gap:g}",
-                    "unit": self.temperature_unit,
+                    "unit": self._face_temperature_unit,
                 },
             )
 

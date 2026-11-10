@@ -72,8 +72,10 @@ group** name. Groups are independent; two outdoor units means two group names.
   wins) breaking exact ties. A brand-new demand must persist for two minutes
   before it can take the valve, which rides out sensor blips.
 - A reversal also waits out the group's cycle time (the longest member's
-  **Minimum cycle time**) and never happens while any member's source is
-  physically heating or cooling.
+  **Minimum cycle time**) and never happens while a member that would _lose_
+  the flip still has its source physically heating or cooling. (The member
+  being awarded the flip may already be running that way — it gets no
+  commands, so nothing needs to quiet down.)
 - While the group runs the other way, a split raises a
   `dual_setpoint_mode_conflict` event once per episode (plus a warning log),
   so you can automate around it.

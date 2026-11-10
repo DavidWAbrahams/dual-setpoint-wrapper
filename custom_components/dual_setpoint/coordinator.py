@@ -190,10 +190,7 @@ class ModeCoordinator:
         elif incumbent is Demand.COOL and cool:
             target = Demand.COOL
         else:
-            ordered = sorted(
-                heat + cool,
-                key=lambda m: (self._started(m), -m.coordination_priority, m.entity_id),
-            )
+            ordered = sorted(heat + cool, key=self._rank)
             if not ordered:
                 target = None
             else:
@@ -208,7 +205,11 @@ class ModeCoordinator:
                     target = self._demand_of(eligible[0])
 
         if target is not incumbent:
-            blocked_until = self._blocked_until(active, now)
+            # The member that would run the group in target's direction is
+            # exempt from the quiet gate: awarding it its own direction sends
+            # it no commands, so its running compressor protects nothing.
+            awarded = self._lead(active, target)
+            blocked_until = self._blocked_until(active, now, awarded)
             if blocked_until is not None:
                 self._schedule(max(timedelta(seconds=1), blocked_until - now))
                 target = incumbent
@@ -230,14 +231,7 @@ class ModeCoordinator:
         if target is not None:
             winners = [m for m in active if self._demand_of(m) is target]
             if winners:
-                deferred_to = min(
-                    winners,
-                    key=lambda m: (
-                        self._started(m),
-                        -m.coordination_priority,
-                        m.entity_id,
-                    ),
-                ).entity_id
+                deferred_to = min(winners, key=self._rank).entity_id
 
         self._applying = True
         try:
@@ -288,7 +282,10 @@ class ModeCoordinator:
             self._applying = False
 
     def _blocked_until(
-        self, active: list[GroupMember], now: datetime
+        self,
+        active: list[GroupMember],
+        now: datetime,
+        awarded: GroupMember | None = None,
     ) -> datetime | None:
         """Return when the gates open for a group-mode change, or None."""
         if self._last_change is not None:
@@ -299,10 +296,11 @@ class ModeCoordinator:
             until = self._last_change + timedelta(seconds=cycle)
             if now < until:
                 return until
-        if any(m.coordination_source_running() for m in active):
-            # Nobody may reverse the valve while any member is physically
-            # running. There is no clock to point at; the backstop retry plus
-            # the members' own state-change notifications will wake us.
+        if any(m is not awarded and m.coordination_source_running() for m in active):
+            # Nobody may reverse the valve while a *losing* member is still
+            # physically running; the awarded member already runs that way and
+            # receives no commands. There is no clock to point at; the backstop
+            # retry plus the members' state-change notifications will wake us.
             return now + QUIET_RETRY
         return None
 
@@ -363,6 +361,21 @@ class ModeCoordinator:
     def _demand_of(self, member: GroupMember) -> Demand:
         entry = self._demands.get(member.entity_id)
         return entry[0] if entry is not None else Demand.NONE
+
+    def _rank(self, member: GroupMember) -> tuple[datetime, int, str]:
+        """Return the FCFS sort key: claim age, then priority, then id."""
+        return (self._started(member), -member.coordination_priority, member.entity_id)
+
+    def _lead(
+        self, active: list[GroupMember], target: Demand | None
+    ) -> GroupMember | None:
+        """Return the member that would run the group in target's direction."""
+        if target is None:
+            return None
+        leads = [m for m in active if self._demand_of(m) is target]
+        if not leads:
+            return None
+        return min(leads, key=self._rank)
 
     def _started(self, member: GroupMember) -> datetime:
         entry = self._demands.get(member.entity_id)
