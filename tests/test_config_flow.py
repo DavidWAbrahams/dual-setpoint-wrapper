@@ -227,6 +227,21 @@ async def test_options_form_shows_coordination_defaults(
 
     defaults = {str(key): key.default() for key in result["data_schema"].schema}
     assert defaults[CONF_COORDINATE_MODES] is False
+
+    # Enabling coordination opens the coordination step with every field
+    # defaulted, so an entry from before coordination existed is coherent.
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {
+            CONF_MIN_GAP: 2.0,
+            CONF_MIN_CYCLE_TIME: {"seconds": 900},
+            CONF_COORDINATE_MODES: True,
+        },
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "coordination"
+
+    defaults = {str(key): key.default() for key in result["data_schema"].schema}
     assert defaults[CONF_COORDINATION_GROUP] == "default"
     assert defaults[CONF_COORDINATION_PRIORITY] == 0
     assert defaults[CONF_THWARTED_HEAT_HOLD] == "off"
@@ -239,12 +254,20 @@ async def test_options_flow_stores_coordination_and_reloads(
 ) -> None:
     """Submitting the coordination fields stores them and reloads the entry."""
     result = await hass.config_entries.options.async_init(loaded_wrapper.entry_id)
+    # Enabling coordination on the first step opens the coordination step.
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         user_input={
             CONF_MIN_GAP: 2.0,
             CONF_MIN_CYCLE_TIME: {"seconds": 900},
             CONF_COORDINATE_MODES: True,
+        },
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "coordination"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
             CONF_COORDINATION_GROUP: "house",
             CONF_COORDINATION_PRIORITY: 3,
             CONF_THWARTED_HEAT_HOLD: "fan_only",

@@ -172,18 +172,30 @@ class DualSetpointConfigFlow(ConfigFlow, domain=DOMAIN):
 class DualSetpointOptionsFlow(OptionsFlow):
     """Handle options for an existing Dual Setpoint Climate entry."""
 
+    def __init__(self) -> None:
+        """Hold the basic options between the two form steps."""
+        self._basic_options: dict[str, Any] = {}
+
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Manage the options."""
+        """Manage the always-available options."""
         if user_input is not None:
             # The DurationSelector hands back a duration dict; store whole
             # seconds so the option stays a simple JSON value.
-            merged = {
-                **self.config_entry.options,
-                **user_input,
+            basic = {
+                CONF_MIN_GAP: user_input[CONF_MIN_GAP],
                 CONF_MIN_CYCLE_TIME: cycle_seconds(user_input[CONF_MIN_CYCLE_TIME]),
+                CONF_COORDINATE_MODES: user_input[CONF_COORDINATE_MODES],
             }
+            if user_input[CONF_COORDINATE_MODES]:
+                # Coordinate with other zones: ask for the coordination
+                # details before saving anything.
+                self._basic_options = basic
+                return await self.async_step_coordination()
+            # Coordination off: store any previously saved coordination
+            # settings untouched so re-enabling keeps them.
+            merged = {**self.config_entry.options, **basic}
             return self.async_create_entry(title=self.config_entry.title, data=merged)
 
         options = self.config_entry.options
@@ -213,13 +225,41 @@ class DualSetpointOptionsFlow(OptionsFlow):
                         # this only adds the day field.
                         selector.DurationSelectorConfig(enable_day=True),
                     ),
-                    # Multi-zone coordination is off by default, and every
-                    # field carries a default so a submission made before
-                    # these existed keeps working unchanged.
+                    # Multi-zone coordination is off by default, and the
+                    # field carries a default so a submission made before it
+                    # existed keeps working unchanged.
                     vol.Optional(
                         CONF_COORDINATE_MODES,
                         default=coordination[CONF_COORDINATE_MODES],
                     ): selector.BooleanSelector(),
+                },
+            ),
+        )
+
+    async def async_step_coordination(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """
+        Manage the coordination options, shown only when coordination is on.
+
+        Home Assistant renders config forms server-side, so fields cannot be
+        greyed out client-side; hiding them behind this second step is the
+        idiomatic equivalent.
+        """
+        if user_input is not None:
+            merged = {
+                **self.config_entry.options,
+                **self._basic_options,
+                **user_input,
+            }
+            return self.async_create_entry(title=self.config_entry.title, data=merged)
+
+        coordination = _coordination_defaults(self.config_entry.options)
+
+        return self.async_show_form(
+            step_id="coordination",
+            data_schema=vol.Schema(
+                {
                     vol.Optional(
                         CONF_COORDINATION_GROUP,
                         default=coordination[CONF_COORDINATION_GROUP],
