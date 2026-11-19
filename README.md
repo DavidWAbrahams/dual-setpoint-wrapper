@@ -123,6 +123,11 @@ if any), `deferred_to` (the entity currently holding the valve for you), and
   wrapper's behavior changes.
 - A group's decision survives member restarts by re-notifying on startup;
   there is no persisted valve lock.
+- A wrapper left in `heat_cool` comes back in `heat_cool` after a Home
+  Assistant restart, even when the underlying source boots into plain heat or
+  cool first: the source's first report after startup is treated as the device
+  waking up, not as an out-of-band change, and the wrapper re-asserts
+  `heat_cool` over it.
 
 ## FAQ
 

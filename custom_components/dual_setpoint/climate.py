@@ -261,6 +261,12 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         self._expected_temp: float | None = None
         self._expected_bounds: tuple[float, float] | None = None
         self._pending = False
+        # A heat_cool face restored while its source was still offline. The
+        # source's first real report after a restart is the mode it woke in,
+        # not a user's out-of-band change, so hold the face off mirroring and
+        # let the engine take the source over instead (see
+        # _async_source_changed).
+        self._takeover_pending = False
 
         self._settle_unsub: CALLBACK_TYPE | None = None
         self._defer_unsub: CALLBACK_TYPE | None = None
@@ -277,6 +283,10 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         self._pre_park_fan_mode: str | None = None
         self._group_ctx: Demand | None = None
         self._deferred_to: str | None = None
+        # The group flip stamp remembered from before a restart; the live one
+        # lives on the coordinator, but this keeps it published until the
+        # group re-derives it (and it is what register() seeds the group from).
+        self._restored_group_last_change: datetime | None = None
 
         self._attach_device(hass)
 
@@ -514,6 +524,11 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             "source_entity": self._source_entity_id,
         }
         if self._coord_enabled:
+            last_change = (
+                self._coordinator.last_change
+                if self._coordinator is not None
+                else self._restored_group_last_change
+            )
             attrs.update(
                 {
                     "demand": self.coordination_demand().value,
@@ -521,12 +536,21 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
                     "group_mode": (
                         self._group_ctx.value if self._group_ctx is not None else None
                     ),
+                    "group_last_change": (
+                        last_change.isoformat() if last_change is not None else None
+                    ),
                     "deferred_to": self._deferred_to,
                     "parked": (
                         self._parked_hold.value
                         if self._parked_hold is not None
                         else None
                     ),
+                    "parked_from": (
+                        self._parked_from.value
+                        if self._parked_from is not None
+                        else None
+                    ),
+                    "pre_park_fan_mode": self._pre_park_fan_mode,
                 }
             )
         return attrs
@@ -550,15 +574,45 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         if self._coord_enabled:
             self._coordinator = get_coordinator(self.hass, self._group_name)
             self._coordinator.register(self)
+            self._validate_restored_park()
 
         # Seed from the source when we have nothing restored to work with.
+        source_state = self._source_state
         if self._attr_hvac_mode is None:
             self._mirror_source_state(initial=True)
+        elif (
+            self._coordinator is None
+            and source_state is not None
+            and source_state.state not in UNAVAILABLE_STATES
+            and self._attr_hvac_mode in (HVACMode.HEAT, HVACMode.COOL, HVACMode.DRY)
+            and source_state.state != self._attr_hvac_mode
+        ):
+            # An uncoordinated single-side face restored over a source that
+            # sits in a different mode after a restart: mirror the source
+            # instead of silently lying on the card. A mere setpoint
+            # difference keeps the restored face — its own setpoint is what
+            # the next command will push. Coordinated members leave the
+            # divergence to arbitration, which re-parks or re-commands.
+            self._mirror_source_state()
+
+        if self._coordinator is not None:
+            # Run the group's decision before this member's own engine gets
+            # a turn: register() and the first arbitration publish the seeded
+            # group mode, so the engine pin below already protects the valve.
+            await self._coordinator.async_member_updated(self)
 
         if self._attr_hvac_mode == HVACMode.HEAT_COOL:
-            await self._async_evaluate(gate_flips=False)
+            if self._available_for_command():
+                await self._async_evaluate(gate_flips=False)
+            else:
+                # Integrations load in whatever order they please, so right
+                # after a restart the source may still be offline while we
+                # come up. Remember the takeover for the moment it answers:
+                # its first report is a remembered mode, and the restored
+                # heat_cool face must re-assert itself over it — the very
+                # thing _async_evaluate just could not do.
+                self._takeover_pending = True
         self.async_write_ha_state()
-        self._async_notify_coordinator()
 
     async def async_will_remove_from_hass(self) -> None:
         """Leave the coordination group before the entity goes away."""
@@ -605,8 +659,45 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         ):
             self._target_temp = self._target_temp_high
 
+        if self._coord_enabled:
+            self._restore_coordination_state(attrs)
+
         self._expected_mode = self._attr_hvac_mode
         self._expected_temp = self._target_temp
+
+    def _restore_coordination_state(self, attrs: dict[str, Any]) -> None:
+        """
+        Load the group context and a remembered park from restored state.
+
+        The park fields stay provisional here: only _validate_restored_park,
+        run once the source is reachable, decides whether the hold still
+        stands or the world moved on while HA was down.
+        """
+        raw_ctx = attrs.get("group_mode")
+        if raw_ctx == Demand.HEAT:
+            self._group_ctx = Demand.HEAT
+        elif raw_ctx == Demand.COOL:
+            self._group_ctx = Demand.COOL
+        raw_ctx_change = attrs.get("group_last_change")
+        if isinstance(raw_ctx_change, str):
+            with contextlib.suppress(ValueError):
+                self._restored_group_last_change = datetime.fromisoformat(
+                    raw_ctx_change
+                )
+        raw_parked = attrs.get("parked")
+        if raw_parked == HVACMode.OFF:
+            self._parked_hold = HVACMode.OFF
+        elif raw_parked == HVACMode.FAN_ONLY:
+            self._parked_hold = HVACMode.FAN_ONLY
+        if self._parked_hold is not None:
+            raw_from = attrs.get("parked_from")
+            if raw_from == Demand.HEAT:
+                self._parked_from = Demand.HEAT
+            elif raw_from == Demand.COOL:
+                self._parked_from = Demand.COOL
+            raw_fan = attrs.get("pre_park_fan_mode")
+            if isinstance(raw_fan, str):
+                self._pre_park_fan_mode = raw_fan
 
     def _cancel_timers(self) -> None:
         """Cancel any pending timers."""
@@ -1117,7 +1208,15 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
             self._async_notify_coordinator()
             return
 
-        if self._attr_hvac_mode is None:
+        takeover = self._takeover_pending and self._attr_hvac_mode == HVACMode.HEAT_COOL
+        if takeover:
+            # The source has just come back online under a restored heat_cool
+            # face. Mirroring this report as out-of-band news would drop the
+            # wrapper to whatever mode the device remembered; the user picked
+            # heat_cool, and that choice outlived the restart. Re-run the
+            # startup takeover on this event instead, ungated like a restart.
+            self._takeover_pending = False
+        elif self._attr_hvac_mode is None:
             self._mirror_source_state(initial=True)
         elif self._pending:
             if not self._source_matches_expected():
@@ -1146,7 +1245,7 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         self.async_write_ha_state()
 
         if self._attr_hvac_mode == HVACMode.HEAT_COOL:
-            self.hass.async_create_task(self._async_evaluate(gate_flips=True))
+            self.hass.async_create_task(self._async_evaluate(gate_flips=not takeover))
         self._async_notify_coordinator()
 
     def _cancel_pending_flip(self) -> None:
@@ -1294,6 +1393,11 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         """Handle a mode change."""
         if hvac_mode == self._attr_hvac_mode:
             return
+        # The user has spoken: a reclaim owed to a previously chosen mode is
+        # void, except for heat_cool itself, which re-arms it below whenever
+        # the source is still too quiet to receive it.
+        if hvac_mode != HVACMode.HEAT_COOL:
+            self._takeover_pending = False
         if self._parked_hold is not None:
             # A command through the card is the user speaking: drop the park
             # without re-asserting the old state and let the new mode stand.
@@ -1343,6 +1447,9 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         await self._async_evaluate(gate_flips=False)
         if self._last_flip is None:
             self._last_flip = dt_util.utcnow()
+        # Chosen while the source was offline: the engine could not reach the
+        # device, so reclaim heat_cool over its first report after it wakes.
+        self._takeover_pending = not self._available_for_command()
         self.async_write_ha_state()
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
@@ -1565,6 +1672,66 @@ class DualSetpointClimate(ClimateEntity, RestoreEntity):
         if self._coordinator is None:
             return
         self.hass.async_create_task(self._coordinator.async_member_updated(self))
+
+    def coordination_restored_context(self) -> tuple[Demand | None, datetime | None]:
+        """Return the group mode and flip stamp remembered across a restart."""
+        return self._group_ctx, self._restored_group_last_change
+
+    async def async_ensure_side(self, side: Demand) -> None:
+        """
+        Bring the source onto the side the group has just awarded us.
+
+        A member restored across a restart (or left idling in a stale mode by
+        drift while HA was down) may press for the group's own direction while
+        its source sits off. Arbitration owns this member's side of the valve,
+        and nothing else in the system will command it, so re-assert it here.
+        """
+        if self._parked_hold is not None or not self._available_for_command():
+            return
+        mode = HVACMode.HEAT if side is Demand.HEAT else HVACMode.COOL
+        temp = self._target_temp_low if side is Demand.HEAT else self._target_temp_high
+        if temp is None:
+            temp = self._target_temp
+        if temp is None:
+            return
+        self._applying = True
+        try:
+            await self._async_command(mode, temp)
+        finally:
+            self._applying = False
+        self.async_write_ha_state()
+
+    def _validate_restored_park(self) -> None:
+        """
+        Keep a park restored from before a restart only while it still holds.
+
+        A park the source cannot confirm (it answers with another mode, or not
+        at all) means the world moved on while HA was down: drop the
+        bookkeeping and let out-of-band mirroring plus re-arbitration
+        re-derive the truth. A confirmed park is treated exactly like a live
+        one so the engine stays out of the way and arbitration sees a parked
+        member it can keep or release.
+        """
+        if self._parked_hold is None:
+            return
+        state = self._source_state
+        if state is None or state.state != self._parked_hold:
+            self._parked_hold = None
+            self._parked_from = None
+            self._parked_fan_set = False
+            self._pre_park_fan_mode = None
+            return
+        # The hold is live: track it as the in-flight command, matching what
+        # a fresh park leaves behind.
+        self._expected_mode = self._parked_hold
+        self._expected_temp = None
+        self._expected_bounds = None
+        if (
+            self._parked_hold is HVACMode.FAN_ONLY
+            and self._thwarted_fan_mode
+            and self.fan_mode == self._thwarted_fan_mode
+        ):
+            self._parked_fan_set = True
 
     async def async_park_for_group(self, thwarted_from: Demand) -> None:
         """

@@ -104,6 +104,14 @@ class GroupMember(Protocol):
         """Undo a group park so the member can act on its own mode again."""
         ...
 
+    async def async_ensure_side(self, side: Demand) -> None:
+        """Bring the source onto the side the group has just awarded us."""
+        ...
+
+    def coordination_restored_context(self) -> tuple[Demand | None, datetime | None]:
+        """Return the group mode and flip stamp the member remembers."""
+        ...
+
     def async_group_context_changed(
         self, group_mode: Demand | None, deferred_to: str | None
     ) -> None:
@@ -133,9 +141,22 @@ class ModeCoordinator:
     # ------------------------------------------------------------------
     # Membership
     # ------------------------------------------------------------------
+    @property
+    def last_change(self) -> datetime | None:
+        """Return when the group last flipped modes (the cycle-gate stamp)."""
+        return self._last_change
+
     def register(self, member: GroupMember) -> None:
         """Add a wrapper to the group."""
         self._members[member.entity_id] = member
+        if self._group_mode is None and self._last_change is None:
+            # A member restored across a restart carries the group's last
+            # decision: seed it so the incumbent survives the restart and
+            # the cycle gate stays armed until a live decision replaces it.
+            mode, last_change = member.coordination_restored_context()
+            if mode is not None or last_change is not None:
+                self._group_mode = mode
+                self._last_change = last_change
 
     def unregister(self, member: GroupMember) -> None:
         """Remove a wrapper; dispose of the group once it stands empty."""
@@ -288,6 +309,18 @@ class ModeCoordinator:
                     await member.async_park_for_group(thwarted_from)
                 elif member.coordination_parked:
                     await member.async_release_park()
+                elif (
+                    target is not None
+                    and demand is target
+                    and member.coordination_parkable
+                    and member.coordination_held_mode() is not target
+                ):
+                    # The group runs this member's own side, yet its source
+                    # sits idle in some other mode — a park that died with a
+                    # restart, or drift created while HA was down. Nothing
+                    # else in the system will ever command this member, so
+                    # re-assert the side we just awarded it.
+                    await member.async_ensure_side(target)
         finally:
             self._applying = False
 

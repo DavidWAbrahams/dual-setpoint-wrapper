@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 from homeassistant.components.climate import (
     ATTR_FAN_MODE,
@@ -15,8 +16,8 @@ from homeassistant.components.climate import (
     HVACAction,
     HVACMode,
 )
-from homeassistant.const import ATTR_ENTITY_ID
-from homeassistant.core import HomeAssistant
+from homeassistant.const import ATTR_ENTITY_ID, STATE_UNAVAILABLE
+from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
@@ -26,6 +27,7 @@ from pytest_homeassistant_custom_component.common import (
     async_capture_events,
 )
 
+from custom_components.dual_setpoint.climate import DualSetpointClimate
 from custom_components.dual_setpoint.const import (
     CONF_COORDINATE_MODES,
     CONF_COORDINATION_GROUP,
@@ -688,3 +690,371 @@ async def test_unloading_a_member_lets_the_group_collapse(
     assert await hass.config_entries.async_unload(pair["bedroom_entry"].entry_id)
     await hass.async_block_till_done()
     assert "house" not in hass.data[DOMAIN].get("groups", {})
+
+
+# ---------------------------------------------------------------------------
+# Restart recovery (plans/restart-park-recovery.md): parks, the group's last
+# decision, and the awarded side must survive a Home Assistant restart.
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_state(hass, entity, *, keep_park: bool) -> State:
+    """Capture one face's published state as a restart would restore it."""
+    state = hass.states.get(entity.entity_id)
+    assert state is not None
+    attrs = dict(state.attributes)
+    if not keep_park:
+        # Simulate restoring an entity written before parks (or the group's
+        # decision) were persisted.
+        for key in (
+            "parked",
+            "parked_from",
+            "pre_park_fan_mode",
+            "group_mode",
+            "group_last_change",
+        ):
+            attrs.pop(key, None)
+    return State(state.entity_id, state.state, attrs)
+
+
+async def _reload_zones(hass, zones) -> None:
+    """
+    Unload the entries (disposing of the group), then set each back up.
+
+    Each zone is an ``(entry, fake, last_state)`` triple; every re-setup
+    sees exactly the state its entity published before the restart.
+    """
+    for entry, _fake, _last_state in zones:
+        assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    for entry, fake, last_state in zones:
+        patcher = patch.object(
+            DualSetpointClimate,
+            "async_get_last_state",
+            new=AsyncMock(return_value=last_state),
+        )
+        patcher.start()
+        try:
+            fake.register_service()
+            await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done()
+        finally:
+            patcher.stop()
+
+
+async def test_restart_keeps_a_confirmed_park_without_recommanding(
+    hass: HomeAssistant,
+) -> None:
+    """A park the source confirms is restored as-is: zero device chatter."""
+    pair = await _make_pair(hass)
+    bedroom, office = pair["bedroom"], pair["office"]
+    bedroom_entity, office_entity = pair["bedroom_entity"], pair["office_entity"]
+    _backdate_demand(bedroom_entity, bedroom_entity.entity_id, 10)
+    await _arbitrate(hass, bedroom_entity)
+    assert _parked(hass, office_entity) == "off"
+
+    bed_state = _snapshot_state(hass, bedroom_entity, keep_park=True)
+    office_state = _snapshot_state(hass, office_entity, keep_park=True)
+    office.set_hvac_mode_calls.clear()
+    office.set_temperature_calls.clear()
+
+    await _reload_zones(
+        hass,
+        [
+            (pair["bedroom_entry"], bedroom, bed_state),
+            (pair["office_entry"], office, office_state),
+        ],
+    )
+
+    office_entity = _wrapper(hass, pair["office_entry"].entry_id)
+    # The park came back: the member reports parked, the face keeps the
+    # user's cool mode, and arbitration confirmed the hold rather than
+    # re-sending it.
+    assert office_entity.coordination_parked is True
+    assert _parked(hass, office_entity) == "off"
+    assert hass.states.get(office_entity.entity_id).state == HVACMode.COOL
+    assert office.set_hvac_mode_calls == []
+    assert office.set_temperature_calls == []
+    # The seeded incumbent means the group runs heat at once — no
+    # CLAIM_DELAY gap in which the parked office would be released early.
+    office_state = hass.states.get(office_entity.entity_id)
+    assert office_state is not None
+    assert office_state.attributes["group_mode"] == "heat"
+
+
+async def test_restart_then_group_flip_releases_the_restored_park(
+    hass: HomeAssistant,
+) -> None:
+    """A room parked before a restart comes back when its turn arrives."""
+    pair = await _make_pair(hass)
+    bedroom = pair["bedroom"]
+    office = pair["office"]
+    bedroom_entity, office_entity = pair["bedroom_entity"], pair["office_entity"]
+    _backdate_demand(bedroom_entity, bedroom_entity.entity_id, 10)
+    await _arbitrate(hass, bedroom_entity)
+    assert _parked(hass, office_entity) == "off"
+
+    bed_state = _snapshot_state(hass, bedroom_entity, keep_park=True)
+    office_state = _snapshot_state(hass, office_entity, keep_park=True)
+    await _reload_zones(
+        hass,
+        [
+            (pair["bedroom_entry"], bedroom, bed_state),
+            (pair["office_entry"], office, office_state),
+        ],
+    )
+    office_entity = _wrapper(hass, pair["office_entry"].entry_id)
+    office.set_temperature_calls.clear()
+
+    # The bedroom warms up and stops pressing for heat.
+    bedroom.external_set(current=22.0)
+    await hass.async_block_till_done()
+
+    # The office's queue position restarted with it, so age its claim, then
+    # wake the group: its side finally wins.
+    _backdate_demand(office_entity, office_entity.entity_id, 10)
+    await _arbitrate(hass, office_entity)
+
+    state = hass.states.get(office_entity.entity_id)
+    assert state is not None
+    assert state.attributes["group_mode"] == "cool"
+    # The restored park lifts and the source returns to its setpoint: the
+    # restart did not orphan it in the hold.
+    assert _parked(hass, office_entity) is None
+    assert hass.states.get(OFFICE_SOURCE).state == HVACMode.COOL
+    assert office.set_temperature_calls[-1] == {
+        ATTR_ENTITY_ID: OFFICE_SOURCE,
+        ATTR_TEMPERATURE: 26.0,
+        ATTR_HVAC_MODE: HVACMode.COOL,
+    }
+
+
+async def test_arbitration_recommands_a_member_awarded_its_own_stale_side(
+    hass: HomeAssistant,
+) -> None:
+    """The self-heal: a winner idling in a stale hold gets its side back."""
+    pair = await _make_pair(hass)
+    bedroom = pair["bedroom"]
+    office = pair["office"]
+    bedroom_entity, office_entity = pair["bedroom_entity"], pair["office_entity"]
+    _backdate_demand(bedroom_entity, bedroom_entity.entity_id, 10)
+    await _arbitrate(hass, bedroom_entity)
+    assert _parked(hass, office_entity) == "off"
+
+    # Restore both members without any coordination attributes, as after an
+    # upgrade from a version that never persisted parks or group decisions:
+    # the office's face comes back cool while its source sits in the hold,
+    # and nothing carries the group's verdict either.
+    bed_state = _snapshot_state(hass, bedroom_entity, keep_park=False)
+    office_state = _snapshot_state(hass, office_entity, keep_park=False)
+    office.set_temperature_calls.clear()
+    office.set_hvac_mode_calls.clear()
+
+    await _reload_zones(
+        hass,
+        [
+            (pair["bedroom_entry"], bedroom, bed_state),
+            (pair["office_entry"], office, office_state),
+        ],
+    )
+    office_entity = _wrapper(hass, pair["office_entry"].entry_id)
+    bedroom_entity = _wrapper(hass, pair["bedroom_entry"].entry_id)
+
+    # Setup commanded nobody: with both claims freshly restarted, no
+    # direction has persisted long enough to claim the valve yet.
+    assert office.set_temperature_calls == []
+    assert office.set_hvac_mode_calls == []
+    assert hass.states.get(OFFICE_SOURCE).state == HVACMode.OFF
+    state = hass.states.get(office_entity.entity_id)
+    assert state is not None
+    assert state.attributes["group_mode"] is None
+
+    # The office's claim is the older of the two, so cool takes the valve.
+    _backdate_demand(office_entity, office_entity.entity_id, 10)
+    _backdate_demand(office_entity, bedroom_entity.entity_id, 5)
+    await _arbitrate(hass, office_entity)
+
+    # Nothing else would ever command this member — arbitration owns its side
+    # of the valve — so arbitration itself pushes the awarded side onto it.
+    state = hass.states.get(office_entity.entity_id)
+    assert state is not None
+    assert state.attributes["group_mode"] == "cool"
+    assert _parked(hass, office_entity) is None
+    assert hass.states.get(OFFICE_SOURCE).state == HVACMode.COOL
+    assert office.set_temperature_calls[-1] == {
+        ATTR_ENTITY_ID: OFFICE_SOURCE,
+        ATTR_TEMPERATURE: 26.0,
+        ATTR_HVAC_MODE: HVACMode.COOL,
+    }
+    # The loser's source is parked to free the valve for the office.
+    assert hass.states.get(BEDROOM_SOURCE).state == HVACMode.OFF
+    assert _parked(hass, bedroom_entity) == "off"
+
+
+async def test_reload_of_a_parked_heat_cool_member_does_not_stomp_the_group(
+    hass: HomeAssistant,
+) -> None:
+    """A solo reload cannot sneak a valve flip past the running group."""
+    pair = await _make_pair(hass)
+    bedroom = pair["bedroom"]
+    bedroom_entity, office_entity = pair["bedroom_entity"], pair["office_entity"]
+
+    # The bedroom joins the split as heat_cool over its cold room, so the
+    # cooling office parks it.
+    await bedroom_entity.async_set_hvac_mode(HVACMode.HEAT_COOL)
+    _backdate_demand(office_entity, office_entity.entity_id, 10)
+    await _arbitrate(hass, office_entity)
+    assert _parked(hass, bedroom_entity) == "off"
+
+    bed_state = _snapshot_state(hass, bedroom_entity, keep_park=False)
+    bedroom.set_temperature_calls.clear()
+    bedroom.set_hvac_mode_calls.clear()
+
+    # Reload only the parked member while the office keeps cooling.
+    assert await hass.config_entries.async_unload(pair["bedroom_entry"].entry_id)
+    await hass.async_block_till_done()
+    patcher = patch.object(
+        DualSetpointClimate,
+        "async_get_last_state",
+        new=AsyncMock(return_value=bed_state),
+    )
+    patcher.start()
+    try:
+        bedroom.register_service()
+        await hass.config_entries.async_setup(pair["bedroom_entry"].entry_id)
+        await hass.async_block_till_done()
+    finally:
+        patcher.stop()
+
+    # The restored member saw the group's decision before its own engine ran:
+    # it sends no heat command against the office's cooling.
+    assert bedroom.set_temperature_calls == []
+    assert bedroom.set_hvac_mode_calls == []
+    assert hass.states.get(OFFICE_SOURCE).state == HVACMode.COOL
+    new_entity = _wrapper(hass, pair["bedroom_entry"].entry_id)
+    state = hass.states.get(new_entity.entity_id)
+    assert state is not None
+    assert state.attributes["group_mode"] == "cool"
+
+
+async def test_restart_keeps_the_group_cycle_gate_armed(
+    hass: HomeAssistant,
+) -> None:
+    """The flip clock survives: a restart cannot rush a reversal."""
+    pair = await _make_pair(hass, min_cycle=900)
+    bedroom = pair["bedroom"]
+    office = pair["office"]
+    bedroom_entity, office_entity = pair["bedroom_entity"], pair["office_entity"]
+    _backdate_demand(bedroom_entity, bedroom_entity.entity_id, 10)
+    _backdate_demand(bedroom_entity, office_entity.entity_id, 5)
+    await _arbitrate(hass, bedroom_entity)
+    assert _parked(hass, office_entity) == "off"
+
+    bed_state = _snapshot_state(hass, bedroom_entity, keep_park=True)
+    office_state = _snapshot_state(hass, office_entity, keep_park=True)
+    await _reload_zones(
+        hass,
+        [
+            (pair["bedroom_entry"], bedroom, bed_state),
+            (pair["office_entry"], office, office_state),
+        ],
+    )
+    office_entity = _wrapper(hass, pair["office_entry"].entry_id)
+
+    # The bedroom lets go and the office's claim is aged, but the group
+    # flipped moments before the restart: the restored flip stamp keeps the
+    # 900 s cycle gate shut, so the reversal waits.
+    bedroom.external_set(current=22.0)
+    await hass.async_block_till_done()
+    _backdate_demand(office_entity, office_entity.entity_id, 10)
+    await _arbitrate(hass, office_entity)
+    state = hass.states.get(office_entity.entity_id)
+    assert state is not None
+    assert state.attributes["group_mode"] == "heat"
+
+    # Once the cycle time has genuinely aged, the flip proceeds.
+    _backdate_group_change(office_entity, 20)
+    await _arbitrate(hass, office_entity)
+    state = hass.states.get(office_entity.entity_id)
+    assert state is not None
+    assert state.attributes["group_mode"] == "cool"
+    assert hass.states.get(OFFICE_SOURCE).state == HVACMode.COOL
+
+
+async def test_coordinated_restart_heat_cool_reclaims_waking_source(
+    hass: HomeAssistant,
+) -> None:
+    """A coordinated heat_cool face reclaims its mode when its source wakes."""
+    entry, bedroom = await _make_zone(
+        hass, name="Bedroom", source_id=BEDROOM_SOURCE, min_cycle=0
+    )
+    entity = _wrapper(hass, entry.entry_id)
+    # Cold room joins the group as heat_cool.
+    bedroom.external_set(current=15.0)
+    await hass.async_block_till_done()
+    await entity.async_set_hvac_mode(HVACMode.HEAT_COOL)
+    await hass.async_block_till_done()
+    assert hass.states.get(entity.entity_id).state == HVACMode.HEAT_COOL
+
+    bed_state = _snapshot_state(hass, entity, keep_park=True)
+
+    # HA restart: the wrapper comes up while its source integration is still
+    # silent, so there is nothing to take over yet.
+    bedroom.set_online(False)
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    patcher = patch.object(
+        DualSetpointClimate,
+        "async_get_last_state",
+        new=AsyncMock(return_value=bed_state),
+    )
+    patcher.start()
+    try:
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    finally:
+        patcher.stop()
+
+    entity = _wrapper(hass, entry.entry_id)
+    assert hass.states.get(entity.entity_id).state == STATE_UNAVAILABLE
+    assert bedroom.set_temperature_calls == []
+    assert bedroom.set_hvac_mode_calls == []
+
+    # The source wakes in a remembered cool mode. That report is the device
+    # booting, not the user with a remote: the face keeps heat_cool and the
+    # engine takes the device over for the cold room.
+    bedroom.mode = HVACMode.COOL
+    bedroom.temperature = 24.0
+    bedroom.set_online(True)
+    await hass.async_block_till_done()
+
+    assert hass.states.get(entity.entity_id).state == HVACMode.HEAT_COOL
+    assert hass.states.get(BEDROOM_SOURCE).state == HVACMode.HEAT
+    assert bedroom.set_temperature_calls[-1] == {
+        ATTR_ENTITY_ID: BEDROOM_SOURCE,
+        ATTR_TEMPERATURE: 21.0,
+        ATTR_HVAC_MODE: HVACMode.HEAT,
+    }
+
+
+async def test_uncoordinated_restart_over_a_moved_source_mirrors_it(
+    hass: HomeAssistant,
+    thermostat,
+    create_wrapper,
+    wrapper_entity,
+) -> None:
+    """A face no longer claims heat over a source left switched off."""
+    thermostat.mode = HVACMode.OFF
+    last_state = State(
+        "climate.thermostat_dual_setpoint",
+        HVACMode.HEAT,
+        {ATTR_TEMPERATURE: 21.0},
+    )
+    await create_wrapper(last_state=last_state)
+    entity = wrapper_entity()
+
+    # The restored face mirrors where the source actually is, without
+    # dragging it back to the mode it did not choose.
+    assert hass.states.get(entity.entity_id).state == HVACMode.OFF
+    assert thermostat.set_temperature_calls == []
+    assert thermostat.set_hvac_mode_calls == []

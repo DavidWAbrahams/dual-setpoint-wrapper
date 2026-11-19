@@ -139,6 +139,69 @@ async def test_restore_heat_cool_recommands_hot_source(
     assert wrapper_entity()._target_temp_high == 22.0
 
 
+async def test_restart_heat_cool_reclaims_mode_over_late_waking_source(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_id
+) -> None:
+    """A heat_cool face waits out a quiet source instead of mirroring its wake."""
+    thermostat.online = False
+    thermostat.temperature = 21.0
+    last_state = State(
+        "climate.thermostat_2",
+        HVACMode.HEAT_COOL,
+        {ATTR_TARGET_TEMP_LOW: 20.0, ATTR_TARGET_TEMP_HIGH: 22.0},
+    )
+    thermostat.current_temperature = 15.0
+    await create_wrapper(min_gap=2.0, last_state=last_state)
+
+    # Integrations come up in any order: the wrapper restored heat_cool over
+    # a source that is still silent, so the card just follows it offline.
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.state == STATE_UNAVAILABLE
+    assert thermostat.set_temperature_calls == []
+    assert thermostat.set_hvac_mode_calls == []
+
+    # The source wakes in its remembered heat mode. That report is not a
+    # user with a remote: the face keeps heat_cool and takes the device over.
+    thermostat.set_online(True)
+    await hass.async_block_till_done()
+
+    state = hass.states.get(wrapper_id())
+    assert state is not None
+    assert state.state == HVACMode.HEAT_COOL
+    assert thermostat.set_temperature_calls == [
+        {
+            ATTR_ENTITY_ID: SOURCE_ENTITY,
+            ATTR_TEMPERATURE: 20.0,
+            ATTR_HVAC_MODE: HVACMode.HEAT,
+        }
+    ]
+
+
+async def test_restart_reclaim_is_one_shot(
+    hass: HomeAssistant, thermostat, create_wrapper, wrapper_id
+) -> None:
+    """Only the wake-up report is overridden; later remote changes mirror."""
+    thermostat.online = False
+    thermostat.temperature = 21.0
+    last_state = State(
+        "climate.thermostat_2",
+        HVACMode.HEAT_COOL,
+        {ATTR_TARGET_TEMP_LOW: 20.0, ATTR_TARGET_TEMP_HIGH: 22.0},
+    )
+    await create_wrapper(min_gap=2.0, last_state=last_state)
+
+    thermostat.set_online(True)
+    await hass.async_block_till_done()
+    assert hass.states.get(wrapper_id()).state == HVACMode.HEAT_COOL
+
+    # The user picks up the remote: with the source already warm, the face
+    # mirrors the choice exactly as it does any other out-of-band change.
+    thermostat.external_set(mode=HVACMode.COOL, temperature=24.0)
+    await hass.async_block_till_done()
+    assert hass.states.get(wrapper_id()).state == HVACMode.COOL
+
+
 async def test_unavailable_source_hides_wrapper_and_blocks_commands(
     hass: HomeAssistant, thermostat, create_wrapper, wrapper_entity, wrapper_id
 ) -> None:
